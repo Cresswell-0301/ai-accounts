@@ -1,0 +1,1959 @@
+#!/Users/nexflo/.local/bin/python3.12
+"""Per-account Claude Code + Codex usage roll-up.
+
+ccusage aggregates multiple config dirs but merges them into one total with no
+per-directory labels. This runs it once per profile dir with the env var pinned
+to that dir, so the directory name supplies the account attribution the usage
+records themselves never carry.
+"""
+import argparse, base64, concurrent.futures as cf, json, os, shutil, subprocess, sys
+
+# Overridable so the tool can be exercised against a scratch tree without
+# touching the real profiles.
+ROOT = os.path.expanduser(os.environ.get("AI_ACCOUNTS_ROOT") or "~/.ai-accounts")
+
+# Keyed on the email, not the directory: the exclusion must follow the account
+# even if it is later logged into some other profile dir.
+EXCLUDED_EMAILS = {"cresswell.mmu+alt@gmail.com"}
+
+ENV_VAR = {"claude": "CLAUDE_CONFIG_DIR", "codex": "CODEX_HOME"}
+
+
+def ccusage_cmd():
+    if shutil.which("ccusage"):
+        return ["ccusage"]
+    return ["npx", "-y", "ccusage@latest"]
+
+
+def claude_identity(d):
+    # A profile dir keeps its config INSIDE it, but the default ~/.claude keeps
+    # config at ~/.claude.json, one level up. Try both.
+    candidates = [os.path.join(d, ".claude.json")]
+    if os.path.realpath(d) == os.path.realpath(os.path.expanduser("~/.claude")):
+        candidates.append(os.path.expanduser("~/.claude.json"))
+    for c in candidates:
+        try:
+            with open(c) as fh:
+                email = (json.load(fh).get("oauthAccount") or {}).get("emailAddress")
+            if email:
+                return email
+        except Exception:
+            continue
+    return None
+
+
+def codex_identity(d):
+    try:
+        with open(os.path.join(d, "auth.json")) as fh:
+            tok = json.load(fh)["tokens"]["id_token"]
+        payload = tok.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        return json.loads(base64.urlsafe_b64decode(payload)).get("email")
+    except Exception:
+        return None
+
+
+def identity(tool, d):
+    return claude_identity(d) if tool == "claude" else codex_identity(d)
+
+
+def discover(include_legacy, include_excluded):
+    """Yield (label, tool, dir, email, skip_reason)."""
+    out = []
+    for tool in ("claude", "codex"):
+        base = os.path.join(ROOT, tool)
+        if not os.path.isdir(base):
+            continue
+        for name in sorted(os.listdir(base)):
+            d = os.path.join(base, name)
+            if not os.path.isdir(d):
+                continue
+            out.append([name, tool, d, identity(tool, d), None])
+    if not os.environ.get("AI_ACCOUNTS_ROOT"):
+        # The default ~/.claude slot is whatever account the user's actual
+        # project sessions run under. Always show it, labelled "project", so
+        # the dashboard follows an account switch instead of missing it - unless
+        # that same account already has its own profile row (then it would be
+        # a duplicate, which is what the old "legacy" row kept being).
+        legacy = os.path.expanduser("~/.claude")
+        if os.path.isdir(os.path.join(legacy, "projects")):
+            who = claude_identity(legacy)
+            known = {r[3] for r in out if r[1] == "claude" and r[3]}
+            if who and who not in known:
+                out.append(["project", "claude", legacy, who, None])
+            elif include_legacy:
+                out.append(["legacy", "claude", legacy, who, None])
+        if include_legacy:
+            old_codex = os.path.expanduser("~/.codex")
+            if os.path.isdir(os.path.join(old_codex, "sessions")):
+                out.append(["legacy", "codex", old_codex, codex_identity(old_codex), None])
+    for row in out:
+        label, tool, d, email, _ = row
+        if email and email in EXCLUDED_EMAILS and not include_excluded:
+            row[4] = "excluded account (%s)" % email
+        elif not has_data(tool, d):
+            signed = (os.path.exists(os.path.join(d, "auth.json")) if tool == "codex"
+                      else bool(keychain_token(d)))
+            row[4] = ("signed in \u2014 no usage recorded yet"
+                      if signed else "not signed in yet")
+    return out
+
+
+def has_data(tool, d):
+    """Cheap pre-check so an empty profile reports plainly instead of
+    surfacing ccusage's raw CliError."""
+    probe = os.path.join(d, "projects" if tool == "claude" else "sessions")
+    if not os.path.isdir(probe):
+        return False
+    for _root, _dirs, files in os.walk(probe):
+        if any(f.endswith(".jsonl") for f in files):
+            return True
+    return False
+
+
+def run_one(entry, period, since, until):
+    label, tool, d, email, skip = entry
+    if skip:
+        out = {"label": label, "tool": tool, "email": email, "skipped": skip}
+        if tool == "codex":
+            out["plan"] = codex_plan(d)
+        return out
+    env = dict(os.environ)
+    env[ENV_VAR[tool]] = d
+    cmd = ccusage_cmd() + [tool, period, "--json"]
+    if since:
+        cmd += ["--since", since]
+    if until:
+        cmd += ["--until", until]
+    try:
+        p = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=900)
+    except subprocess.TimeoutExpired:
+        return {"label": label, "tool": tool, "email": email, "skipped": "timed out"}
+    if p.returncode != 0:
+        msg = (p.stderr or p.stdout or "").strip().splitlines()
+        return {"label": label, "tool": tool, "email": email,
+                "skipped": msg[-1][:80] if msg else "ccusage exit %d" % p.returncode}
+    try:
+        doc = json.loads(p.stdout)
+    except json.JSONDecodeError:
+        return {"label": label, "tool": tool, "email": email, "skipped": "unparseable JSON"}
+    totals = doc.get("totals") or {}
+    series = []
+    for row in (doc.get("daily") or doc.get("weekly") or doc.get("monthly") or []):
+        if not isinstance(row, dict) or not row.get("date"):
+            continue
+        series.append({
+            "date": row["date"],
+            "tokens": row.get("totalTokens", 0) or 0,
+            # same Claude/Codex key split as the totals block
+            "cost": row.get("totalCost") or row.get("costUSD") or 0.0,
+        })
+    series.sort(key=lambda r: r["date"])
+    return {
+        "label": label, "tool": tool, "email": email, "dir": d,
+        "tokens": totals.get("totalTokens", 0) or 0,
+        # Claude reports cost as `totalCost`, Codex as `costUSD`. Same meaning,
+        # different key — reading only the first silently zeroes every Codex row.
+        "cost": totals.get("totalCost") or totals.get("costUSD") or 0.0,
+        "reasoning": totals.get("reasoningOutputTokens", 0) or 0,
+        "input": totals.get("inputTokens", 0) or 0,
+        "output": totals.get("outputTokens", 0) or 0,
+        "cacheRead": totals.get("cacheReadTokens", 0) or 0,
+        "cacheWrite": totals.get("cacheCreationTokens", 0) or 0,
+        "series": series,
+        "limits": limits_for(tool, d),
+    }
+
+
+def human(n):
+    for unit, div in (("B", 1e9), ("M", 1e6), ("K", 1e3)):
+        if n >= div:
+            return "%.1f%s" % (n / div, unit)
+    return str(int(n))
+
+
+HTML = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AI Usage</title>
+<style>
+:root{--bg:#fbfbfa;--card:#fff;--ink:#1a1a19;--mut:#6b6b66;--line:#e6e4e0;
+--ok:#2f9e50;--warn:#b8860b;--bad:#d1332e;--accent:#c96442}
+@media(prefers-color-scheme:dark){:root{--bg:#191918;--card:#212120;--ink:#f0efec;
+--mut:#9a9a93;--line:#333331;--ok:#3fb950;--warn:#d29922;--bad:#f85149;--accent:#d97757}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);
+font:14px/1.5 ui-sans-serif,-apple-system,"SF Pro Text",system-ui,sans-serif;
+-webkit-font-smoothing:antialiased}
+.wrap{max-width:1040px;margin:0 auto;padding:40px 24px 80px}
+h1{font-size:22px;font-weight:600;margin:0 0 4px;letter-spacing:-.01em}
+.sub{color:var(--mut);font-size:13px}
+.pagehead{display:flex;align-items:flex-start;justify-content:space-between;
+gap:16px;margin-bottom:28px}
+.pagehead h1{margin-bottom:4px}
+.titlewrap{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
+.titlewrap h1{margin-bottom:0}
+.dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--ok);
+margin-right:5px;vertical-align:middle;animation:pulse 2s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;
+padding:20px;margin-bottom:20px}
+.card h2{font-size:13px;font-weight:600;margin:0 0 16px;color:var(--mut);
+text-transform:uppercase;letter-spacing:.06em}
+.scroll{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
+th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.06em;
+color:var(--mut);font-weight:600;padding:0 14px 10px 0;border-bottom:1px solid var(--line);
+white-space:nowrap}
+td{padding:13px 14px 13px 0;border-bottom:1px solid var(--line);vertical-align:middle}
+tr:last-child td{border-bottom:none}
+th.n,td.n{text-align:right;padding-right:18px}
+.acct{font-weight:600;white-space:nowrap}
+.acct small{display:block;font-weight:400;color:var(--mut);font-size:11.5px}
+.pct{font-weight:600;font-size:15px;white-space:nowrap}
+.meter{height:5px;border-radius:3px;background:var(--line);margin-top:5px;
+overflow:hidden;min-width:74px}
+.meter i{display:block;height:100%;border-radius:3px}
+.renew{white-space:nowrap;color:var(--mut);font-size:12.5px}
+.renew b{display:block;color:var(--ink);font-weight:500;font-size:13px}
+.empty{color:var(--mut);text-align:center;padding:26px 0}
+td.msg{text-align:center;color:var(--mut)}
+.note{color:var(--mut);font-size:12px;margin-top:14px}
+.warnbadge{color:var(--bad);font-weight:700;margin-left:5px}
+.addrow{display:flex;gap:8px;flex-wrap:wrap;margin-top:16px;align-items:center}
+input,select,button{font:inherit;color:var(--ink);background:var(--bg);
+border:1px solid var(--line);border-radius:7px;padding:7px 10px}
+input{min-width:170px}
+button{cursor:pointer;font-weight:500}
+button:hover{border-color:var(--mut)}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+button.danger{color:var(--bad)}
+button.danger:hover{border-color:var(--bad)}
+button.small{padding:5px 11px;font-size:12.5px}
+button.icon{width:28px;height:28px;padding:0;display:inline-flex;align-items:center;
+justify-content:center;vertical-align:middle}
+button.icon svg{display:block}
+button[data-add]{width:28px;height:28px;padding:0;font-size:17px;line-height:1;
+font-weight:400;color:var(--mut)}
+button[data-add]:hover{color:var(--ink);border-color:var(--accent)}
+.titlegrp{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap}
+.synctime{font-size:12px;color:var(--mut)}
+.headbtns{display:flex;gap:6px;align-items:center}
+button[data-sync]{color:var(--mut)}
+button[data-sync]:hover{color:var(--ink);border-color:var(--accent)}
+button.spinning svg{animation:spin .9s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.ok{color:var(--ok)}.bad{color:var(--bad)}.mut{color:var(--mut)}
+.authlink{display:block;margin-top:6px;font-size:12.5px;word-break:break-all}
+.codebox{display:flex;gap:6px;margin-top:7px}
+.codebox input{flex:1;min-width:0;font-size:12.5px;padding:5px 8px}
+[hidden]{display:none!important}
+.tabs{display:flex;gap:4px;margin:0 0 22px;border-bottom:1px solid var(--line)}
+.tab{background:none;border:none;border-bottom:2px solid transparent;border-radius:0;
+padding:9px 16px;color:var(--mut);font-weight:500;cursor:pointer;margin-bottom:-1px}
+.tab:hover{color:var(--ink);border-color:var(--line)}
+.tab.active{color:var(--ink);border-bottom-color:var(--accent)}
+.cardhead{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}
+.cardhead h2{margin:0}
+.modal{position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;
+align-items:center;justify-content:center;padding:20px;z-index:50}
+.sheet{background:var(--card);border:1px solid var(--line);border-radius:12px;
+padding:22px;width:100%;max-width:380px;box-shadow:0 18px 50px rgba(0,0,0,.35)}
+.sheet h3{margin:0 0 16px;font-size:16px;font-weight:600}
+.field{margin-bottom:13px}
+.field label{display:block;font-size:11px;text-transform:uppercase;letter-spacing:.06em;
+color:var(--mut);font-weight:600;margin-bottom:5px}
+.field input,.field select{width:100%}
+.actions{display:flex;gap:8px;justify-content:flex-end;margin-top:18px}
+</style></head><body><div class="wrap">
+<div class="pagehead">
+  <div class="titlewrap"><h1>AI Usage</h1><div class="sub" id="sub"></div></div>
+  <button id="sync" class="small" title="Refresh every account now">Sync now</button>
+</div>
+
+<div class="card">
+<div class="cardhead">
+<div class="titlegrp"><h2>Claude Code</h2><span class="synctime" id="ccsync"></span></div>
+<div class="headbtns">
+<button class="icon" data-sync="claude" title="Sync Claude Code" aria-label="Sync Claude Code"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 1-15.5 6.2L3 16"/><path d="M3 21v-5h5"/><path d="M3 12a9 9 0 0 1 15.5-6.2L21 8"/><path d="M21 3v5h-5"/></svg></button>
+<button class="small" data-add="claude" title="Add a Claude Code account">+</button>
+</div></div>
+<div class="scroll"><table>
+<thead><tr><th>Account</th><th class="n">Session Limit</th><th>Renew Time</th>
+<th class="n">Weekly Limit</th><th>Renew Time</th><th class="n">Weekly Fable</th>
+<th></th></tr></thead>
+<tbody id="cc"></tbody></table></div>
+</div>
+
+<div class="card">
+<div class="cardhead">
+<div class="titlegrp"><h2>Codex</h2><span class="synctime" id="cxsync"></span></div>
+<div class="headbtns">
+<button class="icon" data-sync="codex" title="Sync Codex" aria-label="Sync Codex"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 1-15.5 6.2L3 16"/><path d="M3 21v-5h5"/><path d="M3 12a9 9 0 0 1 15.5-6.2L21 8"/><path d="M21 3v5h-5"/></svg></button>
+<button class="small" data-add="codex" title="Add a Codex account">+</button>
+</div></div>
+<div class="scroll"><table>
+<thead><tr><th>Account</th><th class="n">Usage</th><th>Renew Time</th>
+<th></th></tr></thead>
+<tbody id="cx"></tbody></table></div>
+</div>
+
+<div id="modal" class="modal" hidden><div class="sheet">
+  <h3>Add account</h3>
+  <div class="field"><label>Tool</label>
+    <select id="ntool"><option value="claude">Claude Code</option><option value="codex">Codex</option></select></div>
+  <div class="field"><label>Email</label>
+    <input id="nemail" placeholder="name@example.com" autocomplete="off">
+    <div class="note" id="npreview"></div></div>
+  <input id="nname" type="hidden">
+  <div class="note" id="accnote"></div>
+  <div class="actions">
+    <button id="canceladd">Cancel</button>
+    <button id="addbtn" class="primary">Add</button>
+  </div>
+</div></div>
+</div>
+<script>
+let DATA = __DATA__, META = __META__;
+const $ = id => document.getElementById(id);
+const colour = w => (w.severity === "critical" || w.pct >= 90) ? "var(--bad)"
+                  : (w.severity === "warning" || w.pct >= 70) ? "var(--warn)" : "var(--ok)";
+
+function when(ts, inferred) {
+  if (inferred && String(inferred).indexOf("window reset") === 0) return "reset \u00b7 full";
+  if (!ts) return "\u2014";
+  const d = new Date(ts * 1000), ms = ts * 1000 - Date.now();
+  if (ms <= 0) return "elapsed";
+  const h = Math.floor(ms / 3.6e6), m = Math.floor(ms % 3.6e6 / 6e4);
+  return ms < 864e5
+    ? d.toLocaleTimeString([], {hour:"2-digit", minute:"2-digit"}) + " \u00b7 " + (h ? h + "h" + String(m).padStart(2,"0") : m + "m")
+    : d.toLocaleDateString([], {weekday:"short", day:"numeric", month:"short"});
+}
+
+function cell(w) {
+  if (!w) return '<td class="n" style="color:var(--mut)">\u2014</td>';
+  const bang = (w.severity === "critical" || w.pct >= 90) ? '<span class="warnbadge">!</span>' : "";
+  return `<td class="n"><span class="pct" style="color:${colour(w)}">${Math.round(w.pct)}%</span>${bang}
+    <div class="meter"><i style="width:${Math.max(w.pct,2)}%;background:${colour(w)}"></i></div></td>`;
+}
+
+function sectionSync(rows) {
+  // The OLDEST reading among HEALTHY rows: a healthy account that has quietly
+  // gone stale still shows here. Rows with an error (blocked, expired) are
+  // already labelled on their own line, so they are counted, not averaged in -
+  // otherwise one blocked account makes the whole section look 18h stale.
+  const healthy = rows.filter(r => r.limits && (r.limits.windows || []).length
+                                   && r.limits.as_of && !r.limits.error);
+  const failing = rows.filter(r => r.limits && r.limits.error).length;
+  const ts = healthy.map(r => r.limits.as_of);
+  if (!ts.length) return failing ? failing + " not reporting" : "";
+  const t = Math.min.apply(null, ts);
+  const d = new Date(t * 1000);
+  const mins = Math.max(0, Math.floor((Date.now() - t * 1000) / 60000));
+  const rel = mins < 1 ? "just now" : mins < 60 ? mins + "m ago"
+            : mins < 1440 ? Math.floor(mins / 60) + "h ago" : Math.floor(mins / 1440) + "d ago";
+  const clock = mins < 1440
+    ? d.toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"})
+    : d.toLocaleDateString([], {weekday: "short", day: "numeric", month: "short"});
+  return "Synced " + clock + " \u00b7 " + rel +
+    (failing ? " \u00b7 " + failing + " not reporting" : "");
+}
+
+function relDays(ts) {
+  if (!ts) return "";
+  const ms = ts * 1000 - Date.now();
+  if (ms <= 0 || ms < 864e5) return "";
+  const d = Math.max(1, Math.round(ms / 864e5));
+  return '<div class="mut">in ' + d + (d === 1 ? " day" : " days") + "</div>";
+}
+
+function rtime(w, kind) {
+  // A window at 0% is not running, so it has no countdown; one at 100% is the
+  // thing you are actually waiting on.
+  if (!w) return '<span style="color:var(--mut)">\u2014</span>';
+  if (!w.resets) {
+    return '<span style="color:var(--mut)">' +
+      (kind === "session" ? "no active session" : "\u2014") + '</span>';
+  }
+  const txt = when(w.resets, w.inferred);
+  const rel = relDays(w.resets);
+  return (w.pct >= 100 ? `<b>${txt}</b>` : txt) + rel;
+}
+
+function actions(r) {
+  const signed = !!r.email;
+  return `<td style="text-align:right;white-space:nowrap">
+    <button class="icon" data-tool="${r.tool}" data-name="${r.label}"
+      title="${signed ? "Re-sign in" : "Sign in"} ${r.label}"
+      aria-label="${signed ? "Re-sign in" : "Sign in"} ${r.label}">${SIGNIN}</button>
+    <button class="icon danger" title="Remove ${r.label}" aria-label="Remove ${r.label}"
+      data-del-tool="${r.tool}" data-del-name="${r.label}">${TRASH}</button>
+    <div class="authlink" id="lk-${r.tool}-${r.label}"></div></td>`;
+}
+
+const SIGNIN = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" ' +
+  'stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+  '<path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/>' +
+  '<path d="M10 17l5-5-5-5"/><path d="M15 12H3"/></svg>';
+
+const TRASH = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" ' +
+  'stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+  '<path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M6 6l1 14h10l1-14"/>' +
+  '<path d="M10 11v6"/><path d="M14 11v6"/></svg>';
+
+const find = (wins, kind) => (wins || []).find(w => w.kind === kind);
+
+function render() {
+  $("sub").innerHTML = META.live ? '<span class="dot"></span>Live' : "generated " + META.generated;
+
+  const cc = DATA.filter(r => r.tool === "claude");
+  $("cc").innerHTML = cc.length ? cc.map(r => {
+    const wins = (r.limits && r.limits.windows) || [];
+    if (!wins.length) {
+      const why = (r.limits && r.limits.error) || r.skipped || "no data";
+      return `<tr><td class="acct">${r.label}<small>${r.email || ""}</small></td>
+        <td colspan="5" class="msg">${why}</td>${actions(r)}</tr>`;
+    }
+    const sess = find(wins, "session"), week = find(wins, "weekly_all"),
+          fab = wins.find(w => w.kind === "weekly_scoped");
+    return `<tr><td class="acct">${r.label}<small>${r.email || ""}</small></td>
+      ${cell(sess)}<td class="renew">${rtime(sess, "session")}</td>
+      ${cell(week)}<td class="renew">${rtime(week, "weekly")}</td>
+      ${cell(fab)}${actions(r)}</tr>`;
+  }).join("") : '<tr><td colspan="6" class="empty">No Claude accounts configured.</td></tr>';
+
+  $("ccsync").textContent = sectionSync(cc);
+  const cx = DATA.filter(r => r.tool === "codex");
+  $("cxsync").textContent = sectionSync(cx);
+  $("cx").innerHTML = cx.length ? cx.map(r => {
+    const wins = (r.limits && r.limits.windows) || [];
+    const plan = r.plan || (r.limits && r.limits.plan) || "";
+    const head = `<td class="acct">${r.label}<small>${r.email || ""}${plan ? " \u00b7 " + plan : ""}</small></td>`;
+    if (!wins.length) {
+      const why = (r.limits && r.limits.error) || r.skipped || "no data";
+      return `<tr>${head}<td colspan="2" class="msg">${why}</td>${actions(r)}</tr>`;
+    }
+    const w = wins[0];
+    const extra = wins.length > 1
+      ? '<div class="mut">' + wins.slice(1).map(x =>
+          x.label + " " + Math.round(x.pct) + "%").join(" \u00b7 ") + "</div>"
+      : "";
+    return `<tr>${head}${cell(w)}
+      <td class="renew"><b>${when(w.resets, w.inferred)}</b>${relDays(w.resets)}${extra}</td>
+      ${actions(r)}</tr>`;
+  }).join("") : '<tr><td colspan="4" class="empty">No Codex accounts configured.</td></tr>';
+
+  wireRows();
+}
+
+function wireRows() {
+  if (!document.querySelectorAll) return;
+  document.querySelectorAll("button[data-tool]").forEach(b => {
+    b.onclick = () => signIn(b.dataset.tool, b.dataset.name, b);
+  });
+  document.querySelectorAll("button[data-del-tool]").forEach(b => {
+    b.onclick = () => removeAccount(b.dataset.delTool, b.dataset.delName, b);
+  });
+}
+
+async function removeAccount(tool, name, btn) {
+  const msg = "Remove " + name + " (" + tool + ")? This deletes its folder, its usage history and, for Claude, its saved credential. You would need to sign in again.";
+  if (!confirm(msg)) return;
+  btn.disabled = true; btn.title = "removing...";
+  const res = await post("/api/remove", {tool, name});
+  if (!res.ok) {
+    btn.disabled = false; btn.title = "Remove " + name;
+    alert("Could not remove: " + (res.error || "unknown error"));
+    return;
+  }
+  await tick();
+}
+
+async function post(path, body) {
+  const r = await fetch(path, {method:"POST", headers:{"Content-Type":"application/json"},
+                              body: JSON.stringify(body)});
+  return r.json();
+}
+
+async function signIn(tool, name, btn) {
+  const slot = $("lk-" + tool + "-" + name);
+  btn.disabled = true; btn.title = "starting sign-in...";
+  const res = await post("/api/login", {tool, name, email: ""});
+  if (!res.url) {
+    slot.innerHTML = '<span class="bad">' + (res.error || "could not start") + "</span>";
+    btn.disabled = false; btn.title = "Sign in " + name; return;
+  }
+  const win = window.open(res.url, "_blank", "noopener");
+  codeBox(tool, name, slot,
+    '<a href="' + res.url + '" target="_blank" rel="noopener">Open sign-in page</a>' +
+    (win ? "" : ' <span class="bad">(popup blocked)</span>') +
+    '<div class="mut">use a private window</div>');
+  btn.title = "waiting for the browser...";
+  waitForLogin(tool, name, slot, () => {
+    btn.disabled = false; btn.title = "Re-sign in " + name;
+  });
+}
+
+function nameFromEmail(email) {
+  // The folder name is derived from the local part, normalised to what the
+  // server accepts: start alphanumeric, then letters/digits/_/- only.
+  const local = String(email || "").split("@")[0].toLowerCase();
+  let n = local.replace(/[^a-z0-9_-]+/g, "-").replace(/^[-_]+|[-_]+$/g, "").slice(0, 32);
+  if (n && !/^[a-z0-9]/.test(n)) n = n.slice(1);
+  return n;
+}
+
+function updatePreview() {
+  const email = $("nemail").value.trim();
+  const n = nameFromEmail(email);
+  $("nname").value = n;
+  $("npreview").innerHTML = email
+    ? (n ? 'account name: <strong>' + n + "</strong>"
+         : '<span class="bad">that email has no usable name</span>')
+    : "";
+}
+
+function openModal(on, tool) {
+  $("modal").hidden = !on;
+  if (!on) return;
+  $("accnote").innerHTML = ""; $("nname").value = ""; $("nemail").value = "";
+  $("npreview").innerHTML = "";
+  if (tool) $("ntool").value = tool;          // pre-fill from the card you clicked
+  const e = $("nemail"); if (e && e.focus) e.focus();
+}
+
+function codeBox(tool, name, slot, extraHtml) {
+  const id = "code-" + tool + "-" + name;
+  slot.innerHTML = extraHtml +
+    '<div class="codebox">' +
+    '<input id="' + id + '" placeholder="paste the code from the sign-in page" autocomplete="off">' +
+    '<button id="' + id + '-go" class="small primary">Submit</button>' +
+    '</div><div class="mut" id="' + id + '-msg">Signed in on another device? Paste its code here.</div>';
+  const go = $(id + "-go"), inp = $(id), msg = $(id + "-msg");
+  const send = async () => {
+    const code = inp.value.trim();
+    if (!code) return;
+    go.disabled = true; msg.textContent = "submitting...";
+    const res = await post("/api/login-code", {tool, name, code});
+    go.disabled = false;
+    msg.innerHTML = res.ok
+      ? '<span class="ok">code accepted - finishing sign-in...</span>'
+      : '<span class="bad">' + res.error + "</span>";
+  };
+  if (go) go.onclick = send;
+  if (inp) inp.onkeydown = e => { if (e.key === "Enter") send(); };
+}
+
+async function syncSection(tool, btn) {
+  btn.disabled = true; btn.classList.add("spinning");
+  try {
+    await post("/api/sync", {tool});
+    const r = await fetch("data.json", {cache: "no-store"});
+    const j = await r.json();
+    DATA = j.rows; META = j.meta; render();
+  } catch (e) {}
+  btn.classList.remove("spinning");
+  setTimeout(() => { btn.disabled = false; }, 5000);
+}
+
+function waitForLogin(tool, name, slot, onDone) {
+  const started = Date.now();
+  const poll = setInterval(async () => {
+    const st = await post("/api/login-state", {tool, name});
+    if (st.signedIn) {
+      clearInterval(poll);
+      slot.innerHTML = '<span class="ok">signed in as ' + (st.email || "") + "</span>";
+      await tick();
+      if (onDone) onDone(true, st);
+    } else if (st.error || Date.now() - started > 300000) {
+      clearInterval(poll);
+      slot.innerHTML = '<span class="bad">' + (st.error || "timed out") + "</span>";
+      if (onDone) onDone(false, st);
+    }
+  }, 3000);
+}
+
+async function addAccount() {
+  const tool = $("ntool").value;
+  const email = $("nemail").value.trim();
+  if (!email || email.indexOf("@") < 1) {
+    $("accnote").innerHTML = '<span class="bad">enter an email address</span>'; return;
+  }
+  const name = nameFromEmail(email);
+  if (!name) {
+    $("accnote").innerHTML = '<span class="bad">could not derive a name from that email</span>'; return;
+  }
+  const b = $("addbtn"); b.disabled = true;
+  const res = await post("/api/add", {tool, name});
+  if (!res.ok) {
+    b.disabled = false;
+    $("accnote").innerHTML = '<span class="bad">' + res.error + "</span>"; return;
+  }
+
+  // One shot: created, now start the sign-in and send them straight to it.
+  $("accnote").innerHTML = '<span class="mut">created ' + name + " - starting sign-in...</span>";
+  const lg = await post("/api/login", {tool, name, email});
+  b.disabled = false;
+  await tick();
+
+  if (!lg.url) {
+    $("accnote").innerHTML = '<span class="bad">created, but sign-in did not start: ' +
+      (lg.error || "no URL") + "</span>";
+    return;
+  }
+  const win = window.open(lg.url, "_blank", "noopener");
+  codeBox(tool, name, $("accnote"),
+    '<a href="' + lg.url + '" target="_blank" rel="noopener">Open sign-in page</a>' +
+    (win ? ' <span class="mut">(opened in a new tab)</span>'
+         : ' <span class="bad">(popup blocked - click the link)</span>') +
+    '<div class="mut">Use a private window, or it will authorize whoever is already signed in.</div>');
+  b.textContent = "waiting...";
+  b.disabled = true;
+  waitForLogin(tool, name, $("accnote"), (ok) => {
+    b.disabled = false; b.textContent = "Add";
+    if (ok) setTimeout(() => openModal(false), 1200);
+  });
+}
+
+function wireUI() {
+  const sync = $("sync");
+  if (sync) sync.onclick = async () => {
+    sync.disabled = true; sync.textContent = "syncing...";
+    try {
+      // Codex can only be refreshed by running each account, which takes a few
+      // seconds; do that first, then pull the fresh numbers for everything.
+      await post("/api/sync", {});
+      const r = await fetch("data.json?force=1", {cache: "no-store"});
+      const j = await r.json();
+      DATA = j.rows; META = j.meta; render();
+    } catch (e) {}
+    sync.textContent = "Sync now";
+    // brief cooldown: a forced sync bypasses the per-account poll floor
+    setTimeout(() => { sync.disabled = false; }, 15000);
+  };
+  const open = $("openadd"); if (open) open.onclick = () => openModal(true);
+  if (document.querySelectorAll) {
+    document.querySelectorAll("button[data-sync]").forEach(b => {
+      b.onclick = () => syncSection(b.dataset.sync, b);
+    });
+    document.querySelectorAll("button[data-add]").forEach(b => {
+      b.onclick = () => openModal(true, b.dataset.add);
+    });
+  }
+  const cancel = $("canceladd"); if (cancel) cancel.onclick = () => openModal(false);
+  const em = $("nemail");
+  if (em) { em.oninput = updatePreview; em.onkeydown = e => { if (e.key === "Enter") addAccount(); }; }
+  const add = $("addbtn"); if (add) add.onclick = addAccount;
+  const modal = $("modal");
+  if (modal) modal.onclick = e => { if (e.target === modal) openModal(false); };
+}
+
+render();
+wireUI();
+
+async function tick() {
+  try {
+    const r = await fetch("data.json", {cache:"no-store"});
+    const j = await r.json();
+    DATA = j.rows; META = j.meta;
+  } catch (e) { /* server gone; keep the last good numbers */ }
+  render();
+}
+
+if (META.live) {
+  setInterval(tick, (META.interval || 10) * 1000);
+  // Countdowns are derived from timestamps we already hold, so they can stay
+  // current without costing an API call.
+  setInterval(render, 10000);
+}
+</script></body></html>"""
+
+
+# ---- quota limits ---------------------------------------------------------
+# These are the SAME numbers Claude Code's /usage and Codex's status show, read
+# out of local state. Both are CACHES written by the CLI: they are only as fresh
+# as the last time that account actually ran, so every reading carries an age.
+
+def _iso_epoch(v):
+    """Accept either an epoch int or an ISO-8601 string."""
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    try:
+        import datetime
+        return datetime.datetime.fromisoformat(str(v).replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
+
+# ---- live quota via the OAuth usage endpoint ------------------------------
+# Claude Code reads /api/oauth/usage with the account's own bearer token. Holding
+# one token per account lets every account be polled live and simultaneously,
+# which the shared macOS Keychain otherwise prevents.
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+
+
+def token_path(d):
+    return os.path.join(d, "token.json")
+
+
+def read_token(d):
+    try:
+        with open(token_path(d)) as fh:
+            return json.load(fh)
+    except Exception:
+        return None
+
+
+def write_token(d, blob):
+    p = token_path(d)
+    fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        json.dump(blob, fh)
+    os.chmod(p, 0o600)
+    return p
+
+
+TOKEN_URL = "https://api.anthropic.com/v1/oauth/token"
+CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+REFRESH_MARGIN = 900   # refresh when under 15 minutes remain
+
+
+def keychain_write(config_dir, blob):
+    """Write the credential back into the SAME item the CLI reads, so the CLI
+    and this tool never diverge. The secret goes in over stdin, not argv."""
+    svc = keychain_service(config_dir)
+    # keychain_token() hands back the INNER object; the CLI stores it wrapped as
+    # {"claudeAiOauth": {...}}. Writing the inner object raw leaves a valid token
+    # the CLI cannot find, and it reports "not logged in".
+    payload = json.dumps({"claudeAiOauth": blob})
+    try:
+        # The value must be passed as an argument: `-w` with no value prompts
+        # interactively and, when fed a pipe, silently stores an EMPTY secret.
+        r = subprocess.run(
+            ["security", "add-generic-password", "-U", "-s", svc,
+             "-a", os.environ.get("USER") or "", "-w", payload],
+            capture_output=True, text=True, timeout=30)
+        if r.returncode != 0:
+            return False
+        back = subprocess.run(
+            ["security", "find-generic-password", "-s", svc, "-w"],
+            capture_output=True, text=True, timeout=30)
+        # Never trust the write: read it back before reporting success.
+        if back.returncode != 0 or back.stdout.strip() != payload:
+            return False
+        # and prove the envelope survived, not just the bytes
+        try:
+            return bool((json.loads(back.stdout).get("claudeAiOauth") or {}).get("accessToken"))
+        except Exception:
+            return False
+    except Exception:
+        return False
+
+
+def refresh_token(config_dir, blob):
+    """Exchange the refresh token for a new pair. Returns (blob, error)."""
+    import urllib.request, urllib.error, time
+    rt = (blob or {}).get("refreshToken")
+    if not rt:
+        return None, "no refresh token"
+    body = json.dumps({"grant_type": "refresh_token",
+                       "refresh_token": rt, "client_id": CLIENT_ID}).encode()
+    req = urllib.request.Request(TOKEN_URL, data=body, headers={
+        "Content-Type": "application/json", "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            doc = json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        return None, "HTTP %d" % e.code
+    except Exception as e:
+        return None, str(e)[:50]
+    access = doc.get("access_token")
+    if not access:
+        return None, "no access_token in response"
+    fresh = dict(blob)
+    fresh["accessToken"] = access
+    if doc.get("refresh_token"):
+        fresh["refreshToken"] = doc["refresh_token"]
+    if doc.get("expires_in"):
+        fresh["expiresAt"] = int((time.time() + float(doc["expires_in"])) * 1000)
+    # Each refresh issues a NEW refresh token with a fresh 28-day window. Record
+    # it, or the stored expiry silently keeps the original login's deadline and
+    # the credential looks like it is about to die when it is not.
+    if doc.get("refresh_token_expires_in"):
+        fresh["refreshTokenExpiresAt"] = int(
+            (time.time() + float(doc["refresh_token_expires_in"])) * 1000)
+    if isinstance(doc.get("scope"), str):
+        fresh["scopes"] = doc["scope"].split()
+    return fresh, None
+
+
+def token_for(config_dir):
+    """The credential to use now, refreshed first if it is about to expire."""
+    import time
+    blob = keychain_token(config_dir)
+    if not blob:
+        return None, "not signed in"
+    exp = (blob.get("expiresAt") or 0) / 1000.0
+    if exp and exp - time.time() > REFRESH_MARGIN:
+        return blob, None
+    fresh, err = refresh_token(config_dir, blob)
+    if not fresh:
+        return blob, "refresh failed: %s" % err
+    keychain_write(config_dir, fresh)
+    return fresh, None
+
+
+def keychain_service(config_dir=None):
+    """Claude Code scopes each config dir to its OWN Keychain item, named
+    "Claude Code-credentials-<sha256(dir)[:8]>". The default ~/.claude uses the
+    bare name. This is what lets several accounts be signed in at once."""
+    import hashlib
+    if not config_dir:
+        return "Claude Code-credentials"
+    real = os.path.realpath(os.path.expanduser(config_dir))
+    if real == os.path.realpath(os.path.expanduser("~/.claude")):
+        return "Claude Code-credentials"
+    return "Claude Code-credentials-%s" % hashlib.sha256(real.encode()).hexdigest()[:8]
+
+
+def keychain_token(config_dir=None):
+    """Read that config dir's own credential. No token ever leaves the Keychain."""
+    try:
+        r = subprocess.run(["security", "find-generic-password",
+                            "-s", keychain_service(config_dir), "-w"],
+                           capture_output=True, text=True, timeout=30)
+        if r.returncode != 0:
+            return None
+        return (json.loads(r.stdout).get("claudeAiOauth") or {}) or None
+    except Exception:
+        return None
+
+
+def live_claude_usage(blob):
+    """Returns (windows, error). Never raises."""
+    import urllib.request, urllib.error
+    tok = (blob or {}).get("accessToken")
+    if not tok:
+        return None, "no token"
+    req = urllib.request.Request(USAGE_URL, headers={
+        "Authorization": "Bearer " + tok,
+        "anthropic-beta": "oauth-2025-04-20",
+        "Accept": "application/json",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            doc = json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            # Anthropic states the penalty; retrying inside it just extends it.
+            ra = e.headers.get("retry-after") if e.headers else None
+            try:
+                ra = int(float(ra)) if ra else 0
+            except ValueError:
+                ra = 0
+            return None, "Rate Limit|%d" % ra
+        if e.code in (401, 403):
+            # A 403 can be the ORG refusing OAuth, not an expired token; read
+            # the body so the row says which, since the fixes are different.
+            try:
+                body = json.loads(e.read().decode())
+                msg = ((body.get("error") or {}).get("message") or "")
+            except Exception:
+                msg = ""
+            if "not allowed for this organization" in msg:
+                return None, "Blocked by organization"
+            return None, "token expired \u2014 re-login"
+        return None, "HTTP %d" % e.code
+    except Exception as e:
+        return None, str(e)[:40]
+
+    u = doc.get("utilization") or doc
+    wins = []
+    for e in (u.get("limits") or []):
+        pct = e.get("percent")
+        if pct is None:
+            continue
+        kind = e.get("kind")
+        if kind == "session":
+            label = "Session (5hr)"
+        elif kind == "weekly_all":
+            label = "Weekly (7 day)"
+        elif kind == "weekly_scoped":
+            m = ((e.get("scope") or {}).get("model") or {}).get("display_name")
+            label = "Weekly %s" % (m or "scoped")
+        else:
+            label = str(kind or "window")
+        wins.append({"label": label, "kind": kind, "pct": pct,
+                     "left": max(0, 100 - pct),
+                     "resets": _iso_epoch(e.get("resets_at")),
+                     "severity": e.get("severity"),
+                     "active": bool(e.get("is_active")), "live": True})
+    return (wins or None), None
+
+
+PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
+
+# Profile name -> the account it must hold. An empty profile would otherwise
+# accept ANY token, which is how a slot silently ends up mislabelled.
+EXPECT = {}
+
+
+# The page can re-render every few seconds for free, but each account may only
+# be polled so often before the API answers 429. These are decoupled: the cache
+# below is what the page reads, and it refills on its own schedule.
+MIN_POLL_SECONDS = 120   # 2 minutes per account
+BACKOFF_SECONDS = 300
+_usage_cache = {}   # dir -> {"windows", "at", "next_ok", "stale_reason"}
+
+
+CACHE_FILE = os.path.join(ROOT, ".usage-cache.json")
+
+
+def _cache_load():
+    """Survive restarts: without this, every restart re-polls every account at
+    once, which is what trips the rate limit."""
+    try:
+        with open(CACHE_FILE) as fh:
+            for k, v in (json.load(fh) or {}).items():
+                if isinstance(v, dict) and v.get("windows"):
+                    _usage_cache[k] = {"windows": v["windows"], "at": v.get("at"),
+                                       "next_ok": 0, "stale_reason": None}
+    except Exception:
+        pass
+
+
+def _cache_save():
+    try:
+        tmp = CACHE_FILE + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump({k: {"windows": v.get("windows"), "at": v.get("at")}
+                       for k, v in _usage_cache.items() if v.get("windows")}, fh)
+        os.replace(tmp, CACHE_FILE)
+    except Exception:
+        pass
+
+
+def cached_usage(d, blob):
+    """Poll at most every MIN_POLL_SECONDS per account; on 429 back off and keep
+    serving the last good reading rather than pretending there is no data."""
+    import time
+    now = time.time()
+    ent = _usage_cache.get(d)
+    if ent and now < ent.get("next_ok", 0):
+        return ent["windows"], ent["at"], ent.get("stale_reason")
+
+    wins, err = live_claude_usage(blob)
+    if wins:
+        _usage_cache[d] = {"windows": wins, "at": now,
+                           "next_ok": now + MIN_POLL_SECONDS, "stale_reason": None}
+        _cache_save()
+        return wins, now, None
+
+    reason = err or "fetch failed"
+    wait = MIN_POLL_SECONDS
+    if str(err).startswith("Rate Limit"):
+        ra = 0
+        if "|" in str(err):
+            try:
+                ra = int(str(err).split("|", 1)[1])
+            except ValueError:
+                ra = 0
+        # honour the server's retry-after (+ a margin); never shorter than our floor
+        wait = max(BACKOFF_SECONDS, ra + 60)
+        reason = "Rate Limit" + (" \u00b7 retry in %dm" % max(1, wait // 60))
+    if ent and ent.get("windows"):
+        ent["next_ok"] = now + wait
+        ent["stale_reason"] = reason
+        return ent["windows"], ent["at"], reason
+    _usage_cache[d] = {"windows": None, "at": None,
+                       "next_ok": now + wait, "stale_reason": reason}
+    return None, None, reason
+
+
+def token_owner(blob):
+    """Ask the API whose token this is. Sequence is not proof \u2014 a browser
+    session can authorize a different account than the one requested."""
+    import urllib.request, urllib.error
+    tok = (blob or {}).get("accessToken")
+    if not tok:
+        return None, "no token"
+    req = urllib.request.Request(PROFILE_URL, headers={
+        "Authorization": "Bearer " + tok,
+        "anthropic-beta": "oauth-2025-04-20", "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            d = json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        return None, "HTTP %d" % e.code
+    except Exception as e:
+        return None, str(e)[:40]
+    acct = d.get("account") or {}
+    org = d.get("organization") or {}
+    return {"email": acct.get("email"), "uuid": acct.get("uuid"),
+            "tier": org.get("rate_limit_tier"),
+            "plan": org.get("organization_type")}, None
+
+
+def capture(account):
+    """Copy the credential the CLI just wrote into that account's own store."""
+    d = os.path.join(ROOT, "claude", account)
+    if not os.path.isdir(d):
+        print("no such profile: %s" % d, file=sys.stderr)
+        return 2
+    blob = keychain_token(d)
+    if not blob:
+        print("no credential in the Keychain \u2014 sign in first", file=sys.stderr)
+        return 1
+    who, err = token_owner(blob)
+    if not who:
+        print("could not identify the token: %s" % err, file=sys.stderr)
+        return 1
+    expected = claude_identity(d) or EXPECT.get(account)
+    if not expected:
+        print("refusing: profile '%s' has no known account, so any token would "
+              "be accepted." % account, file=sys.stderr)
+        print("  Re-run with the account it belongs to:", file=sys.stderr)
+        print("    ai-usage --capture %s --expect <email>" % account, file=sys.stderr)
+        return 1
+    if who["email"] and expected != who["email"]:
+        print("\u26a0 MISMATCH: profile '%s' expects %s but the Keychain token "
+              "belongs to %s" % (account, expected, who["email"]), file=sys.stderr)
+        print("  Not capturing. Sign in as %s (private window) and retry."
+              % expected, file=sys.stderr)
+        return 1
+    blob = dict(blob)
+    blob["capturedEmail"] = who["email"]
+    blob["capturedUuid"] = who["uuid"]
+    blob["rateLimitTier"] = who["tier"]
+    path = write_token(d, blob)
+    print("captured %s \u2192 %s (mode 600)" % (who["email"], path.replace(os.path.expanduser("~"), "~")))
+    print("  plan: %s / %s" % (who["plan"], who["tier"]))
+    return 0
+
+
+def claude_limits(d):
+    cfg = os.path.join(d, ".claude.json")
+    if not os.path.exists(cfg) and os.path.realpath(d) == os.path.realpath(
+            os.path.expanduser("~/.claude")):
+        cfg = os.path.expanduser("~/.claude.json")
+    try:
+        with open(cfg) as fh:
+            cached = json.load(fh).get("cachedUsageUtilization") or {}
+    except Exception:
+        return None
+    u = cached.get("utilization") or {}
+    if not u:
+        return None
+
+    wins = []
+    # `limits` is what Claude Code's own Account & Usage panel renders: every
+    # window including model-scoped ones, each with its own severity.
+    for e in (u.get("limits") or []):
+        pct = e.get("percent")
+        if pct is None:
+            continue
+        kind = e.get("kind")
+        if kind == "session":
+            label = "Session (5hr)"
+        elif kind == "weekly_all":
+            label = "Weekly (7 day)"
+        elif kind == "weekly_scoped":
+            model = ((e.get("scope") or {}).get("model") or {}).get("display_name")
+            label = "Weekly %s" % (model or "scoped")
+        else:
+            label = str(kind or "window")
+        wins.append({"label": label, "kind": kind, "pct": pct,
+                     "left": max(0, 100 - pct),
+                     "resets": _iso_epoch(e.get("resets_at")),
+                     "severity": e.get("severity"),
+                     "active": bool(e.get("is_active"))})
+
+    if not wins:  # older payloads without the limits array
+        for key, label in (("five_hour", "Session (5hr)"), ("seven_day", "Weekly (7 day)")):
+            w = u.get(key) or {}
+            pct = w.get("utilization")
+            if pct is None:
+                continue
+            wins.append({"label": label, "kind": key, "pct": pct,
+                         "left": max(0, 100 - pct),
+                         "resets": _iso_epoch(w.get("resets_at")),
+                         "severity": None, "active": False})
+
+    if not wins:
+        return None
+    return {"windows": wins,
+            "as_of": (cached.get("fetchedAtMs") or 0) / 1000.0 or None,
+            "plan": None, "credits": None,
+            "account": cached.get("accountUuid")}
+
+
+def codex_limits(d):
+    """Newest rollout wins; scan its token_count events backwards for the last
+    one whose windows are populated (many carry rate_limits with null windows)."""
+    import re
+    sess = os.path.join(d, "sessions")
+    if not os.path.isdir(sess):
+        return None
+    files = []
+    for root, _dirs, names in os.walk(sess):
+        for n in names:
+            if n.endswith(".jsonl"):
+                fp = os.path.join(root, n)
+                try:
+                    files.append((os.path.getmtime(fp), fp))
+                except OSError:
+                    pass
+    files.sort(reverse=True)
+    pat = re.compile(r'"rate_limits":\{.*?"primary":\{(.*?)\}.*?"secondary":(\{.*?\}|null)')
+    for _mt, fp in files[:6]:
+        try:
+            with open(fp, errors="replace") as fh:
+                lines = fh.readlines()
+        except OSError:
+            continue
+        for line in reversed(lines):
+            if '"rate_limits"' not in line or '"primary":{' not in line:
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            info = (obj.get("payload") or {})
+            rl = info.get("rate_limits") or (info.get("info") or {}).get("rate_limits")
+            if not rl or not rl.get("primary"):
+                continue
+            prim, sec = rl.get("primary") or {}, rl.get("secondary") or {}
+            # window_minutes tells us which window is which: 300 = 5h, 10080 = 7d
+            windows = {}
+            for w in (prim, sec):
+                if not w:
+                    continue
+                mins = w.get("window_minutes")
+                key = "five_hour" if mins and mins <= 600 else "weekly"
+                pct = w.get("used_percent")
+                windows[key] = {"pct": pct,
+                                "left": None if pct is None else max(0.0, 100.0 - pct),
+                                "resets": _iso_epoch(w.get("resets_at"))}
+            creds = rl.get("credits") or {}
+            wins = []
+            for key, label in (("five_hour", "Session (5hr)"), ("weekly", "Weekly (7 day)")):
+                w = windows.get(key)
+                if not w or w.get("pct") is None:
+                    continue
+                wins.append({"label": label, "kind": key, "pct": w["pct"],
+                             "left": w["left"], "resets": w["resets"],
+                             "severity": None, "active": False})
+            if not wins:
+                continue
+            return {
+                "windows": wins,
+                "as_of": _iso_epoch(obj.get("timestamp")) or os.path.getmtime(fp),
+                "plan": rl.get("plan_type"),
+                "credits": (None if not creds.get("has_credits") and creds.get("balance") in (None, "0")
+                            else {"balance": creds.get("balance"),
+                                  "unlimited": bool(creds.get("unlimited"))}),
+                "account": None,
+            }
+    return None
+
+
+def last_activity(tool, d):
+    """Newest session-file mtime in a profile — when that account last ran."""
+    probe = os.path.join(d, "projects" if tool == "claude" else "sessions")
+    newest = None
+    for root, _dirs, files in os.walk(probe):
+        for f in files:
+            if not f.endswith(".jsonl"):
+                continue
+            try:
+                m = os.path.getmtime(os.path.join(root, f))
+            except OSError:
+                continue
+            if newest is None or m > newest:
+                newest = m
+    return newest
+
+
+def infer_reset(lim, tool, d):
+    """An idle account only recovers: if a window's reset time has passed and
+    nothing ran under that account since, the allowance is back. A deduction,
+    so it is labelled."""
+    import time
+    if not lim:
+        return lim
+    act = last_activity(tool, d)
+    now = time.time()
+    for w in lim.get("windows") or []:
+        r = w.get("resets")
+        if not r or r > now:
+            continue
+        if act is None or act <= r:
+            w["pct"], w["left"] = 0, 100
+            w["inferred"] = "window reset, no activity since"
+        else:
+            w["inferred"] = "stale \u2014 account ran after this reading"
+    return lim
+
+
+def codex_limit_error(d):
+    """When a Codex account is exhausted the request is rejected BEFORE any
+    usage is computed, so rate_limits comes back null. The refusal text is then
+    the only record of the state, and it carries the reset time."""
+    import re, datetime
+    sess = os.path.join(d, "sessions")
+    if not os.path.isdir(sess):
+        return None
+    files = []
+    for root, _dirs, names in os.walk(sess):
+        for n in names:
+            if n.endswith(".jsonl"):
+                fp = os.path.join(root, n)
+                try:
+                    files.append((os.path.getmtime(fp), fp))
+                except OSError:
+                    pass
+    files.sort(reverse=True)
+    for mt, fp in files[:4]:
+        try:
+            with open(fp, errors="replace") as fh:
+                lines = fh.readlines()
+        except OSError:
+            continue
+        for line in reversed(lines):
+            if "usage limit" not in line:
+                continue
+            m = re.search(r"try again at ([A-Z][a-z]{2} \d{1,2})[a-z]{2}, (\d{4}) "
+                          r"(\d{1,2}):(\d{2}) ?([AP]M)", line)
+            resets = None
+            if m:
+                mon_day, year, hh, mm, ap = m.groups()
+                hh = int(hh) % 12 + (12 if ap == "PM" else 0)
+                try:
+                    resets = datetime.datetime.strptime(
+                        "%s %s %02d:%s" % (mon_day, year, hh, mm),
+                        "%b %d %Y %H:%M").timestamp()
+                except ValueError:
+                    resets = None
+            return {"windows": [{"label": "Usage", "kind": "usage", "pct": 100,
+                                 "left": 0, "resets": resets,
+                                 "severity": "critical", "active": True,
+                                 "note": "limit reached"}],
+                    "as_of": mt, "plan": codex_plan(d), "credits": None,
+                    "account": None}
+    return None
+
+
+def codex_plan(d):
+    try:
+        with open(os.path.join(d, "auth.json")) as fh:
+            tok = json.load(fh)["tokens"]["id_token"]
+        import base64
+        payload = tok.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        c = json.loads(base64.urlsafe_b64decode(payload))
+        return (c.get("https://api.openai.com/auth") or {}).get("chatgpt_plan_type")
+    except Exception:
+        return None
+
+
+def limits_for(tool, d):
+    if tool == "claude":
+        blob, tok_err = token_for(d)
+        if blob:
+            wins, at, reason = cached_usage(d, blob)
+            if wins:
+                return {"windows": wins, "as_of": at, "live": not reason,
+                        "error": reason,
+                        "plan": blob.get("subscriptionType"), "credits": None,
+                        "account": None}
+            cached = claude_limits(d)
+            if cached:
+                cached["error"] = reason
+                return infer_reset(cached, tool, d)
+            return {"windows": [], "as_of": None, "live": False,
+                    "error": reason or "no data", "plan": None,
+                    "credits": None, "account": None}
+    if tool == "codex":
+        # A run that succeeded and a run that was refused are both evidence;
+        # whichever happened LAST is the truth. Preferring the one with numbers
+        # would show an old healthy percentage for an account now refused.
+        ok = codex_limits(d)
+        refused = codex_limit_error(d)
+        cands = [x for x in (ok, refused) if x and x.get("windows")]
+        lim = max(cands, key=lambda x: x.get("as_of") or 0) if cands else (ok or refused)
+        return infer_reset(lim, tool, d)
+    lim = claude_limits(d)
+    return infer_reset(lim, tool, d)
+
+
+def fmt_age(ts):
+    import time
+    if not ts:
+        return "never"
+    sec = max(0, time.time() - ts)
+    if sec < 90:
+        return "just now"
+    if sec < 3600:
+        return "%dm ago" % (sec // 60)
+    if sec < 86400:
+        return "%dh ago" % (sec // 3600)
+    return "%dd ago" % (sec // 86400)
+
+
+def fmt_reset(ts):
+    import datetime, time
+    if not ts:
+        return "-"
+    delta = ts - time.time()
+    when = datetime.datetime.fromtimestamp(ts)
+    if delta <= 0:
+        return "elapsed"
+    if delta < 86400:
+        h, m = int(delta // 3600), int((delta % 3600) // 60)
+        return "%s %s" % (when.strftime("%H:%M"), ("+%dh%02dm" % (h, m)) if h else "+%dm" % m)
+    return when.strftime("%a %d %b %H:%M")
+
+
+def gauge(pct, width=12):
+    if pct is None:
+        return " " * width
+    filled = int(round(min(pct, 100) / 100.0 * width))
+    return "\u2588" * filled + "\u2591" * (width - filled)
+
+
+def cli_bin(tool):
+    import glob
+    pat = ("anthropic.claude-code-*-darwin-*" if tool == "claude"
+           else "openai.chatgpt-*-darwin-*")
+    dirs = sorted(glob.glob(os.path.expanduser("~/.vscode/extensions/" + pat)))
+    if not dirs:
+        return None
+    tail = ("resources/native-binary/claude" if tool == "claude"
+            else "bin/macos-aarch64/codex")
+    path = os.path.join(dirs[-1], tail)
+    return path if os.path.exists(path) else None
+
+
+def auth_check():
+    """Ask each CLI directly. The config file can show a stale account after a
+    credential is clobbered, so only the CLI's own answer is trustworthy."""
+    rows = []
+    cb, xb = cli_bin("claude"), cli_bin("codex")
+
+    def claude_one(label, cfg):
+        if not cb:
+            return (label, "claude", "?", "claude CLI not found")
+        env = dict(os.environ)
+        if cfg:
+            env["CLAUDE_CONFIG_DIR"] = cfg
+        else:
+            env.pop("CLAUDE_CONFIG_DIR", None)
+        try:
+            r = subprocess.run([cb, "auth", "status"], env=env,
+                               capture_output=True, text=True, timeout=120)
+            d = json.loads(r.stdout)
+            return (label, "claude", d.get("email") or "-",
+                    "LOGGED IN" if d.get("loggedIn") else "logged out")
+        except Exception as e:
+            return (label, "claude", "-", "check failed: %s" % str(e)[:40])
+
+    rows.append(claude_one("DEFAULT (~/.claude)", None))
+    base = os.path.join(ROOT, "claude")
+    if os.path.isdir(base):
+        for n in sorted(os.listdir(base)):
+            d = os.path.join(base, n)
+            if os.path.isdir(d):
+                rows.append(claude_one(n, d))
+
+    base = os.path.join(ROOT, "codex")
+    if os.path.isdir(base) and xb:
+        for n in sorted(os.listdir(base)):
+            d = os.path.join(base, n)
+            if not os.path.isdir(d):
+                continue
+            env = dict(os.environ); env["CODEX_HOME"] = d
+            try:
+                r = subprocess.run([xb, "login", "status"], env=env,
+                                   capture_output=True, text=True, timeout=120)
+                out = (r.stdout or r.stderr).strip().splitlines()
+                txt = out[0] if out else "?"
+                rows.append((n, "codex", codex_identity(d) or "-",
+                             "LOGGED IN" if "Logged in" in txt else txt[:30]))
+            except Exception as e:
+                rows.append((n, "codex", "-", "check failed"))
+
+    print("%-22s %-7s %-34s %s" % ("PROFILE", "TOOL", "ACCOUNT", "LIVE STATUS"))
+    print("-" * 84)
+    for r in rows:
+        print("%-22s %-7s %-34s %s" % r)
+    import collections
+    pairs = [(r[1], r[2]) for r in rows if r[3] == "LOGGED IN" and r[2] not in ("-", "?")]
+    emails = [e for _t, e in pairs]
+    # Only a clash WITHIN one tool matters: the same person on Claude and on
+    # Codex is two different services, not a mislabelled slot.
+    dupes = [e for (t, e), c in collections.Counter(pairs).items() if c > 1]
+    print()
+    print("  logged in: %d of %d" % (len(emails), len(rows)))
+    if dupes:
+        print("  \u26a0 SAME ACCOUNT IN TWO PROFILES: %s" % ", ".join(dupes))
+    return 0
+
+
+# ---- account management from the dashboard --------------------------------
+_logins = {}          # "tool/name" -> {"proc", "url", "started", "done", "error"}
+_logins_lock = None
+
+
+def _valid_name(n):
+    import re
+    return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,31}", n or ""))
+
+
+def add_profile(tool, name):
+    if tool not in ("claude", "codex"):
+        return False, "unknown tool"
+    if not _valid_name(name):
+        return False, "name must be letters, digits, - or _ (max 32)"
+    d = os.path.join(ROOT, tool, name)
+    if os.path.exists(d):
+        return False, "that account already exists"
+    try:
+        os.makedirs(d, mode=0o700)
+    except Exception as e:
+        return False, str(e)[:60]
+    return True, d
+
+
+def remove_profile(tool, name):
+    """Delete a profile and, for Claude, its Keychain item. Refuses anything
+    that does not resolve to a direct child of the accounts folder."""
+    import shutil
+    if tool not in ("claude", "codex"):
+        return False, "unknown tool"
+    if not _valid_name(name):
+        return False, "bad account name"
+    base = os.path.realpath(os.path.join(ROOT, tool))
+    d = os.path.realpath(os.path.join(base, name))
+    if os.path.dirname(d) != base or not os.path.isdir(d):
+        return False, "no such account"
+
+    removed = {"dir": False, "keychain": False}
+    if tool == "claude":
+        svc = keychain_service(d)
+        try:
+            r = subprocess.run(["security", "delete-generic-password", "-s", svc],
+                               capture_output=True, text=True, timeout=30)
+            removed["keychain"] = r.returncode == 0
+        except Exception:
+            pass
+    try:
+        shutil.rmtree(d)
+        removed["dir"] = not os.path.exists(d)
+    except Exception as e:
+        return False, str(e)[:60]
+    _usage_cache.pop(d, None)
+    _logins.pop("%s/%s" % (tool, name), None)
+    return True, removed
+
+
+AUTO_CODEX_SECONDS = 3600  # automatic Codex refresh: once an hour per account
+MANUAL_MIN_GAP = 60        # Sync now refreshes immediately; this only absorbs double-clicks
+PROBE_PROMPT = "reply with just: ok"
+_probe_last = {}           # codex dir -> epoch of last probe
+
+
+def probe_codex(d, min_gap=MANUAL_MIN_GAP):
+    """Codex has no usage endpoint, so the only way to refresh its numbers is to
+    make the account run. An exhausted account is refused before any usage is
+    counted, so a probe only costs quota when there is quota to spend."""
+    import time
+    now = time.time()
+    last = _probe_last.get(d, 0)
+    if now - last < min_gap:
+        return {"status": "skipped", "detail": "checked %ds ago" % int(now - last)}
+    bin_path = cli_bin("codex")
+    if not bin_path:
+        return {"status": "error", "detail": "codex CLI not found"}
+    if not os.path.exists(os.path.join(d, "auth.json")):
+        return {"status": "skipped", "detail": "not signed in"}
+    _probe_last[d] = now
+    env = dict(os.environ); env["CODEX_HOME"] = d
+    try:
+        r = subprocess.run([bin_path, "exec", "--skip-git-repo-check", PROBE_PROMPT],
+                           env=env, stdin=subprocess.DEVNULL,
+                           capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        return {"status": "error", "detail": "timed out"}
+    out = (r.stdout or "") + (r.stderr or "")
+    if "usage limit" in out:
+        return {"status": "limited", "detail": "limit reached"}
+    return {"status": "ok" if r.returncode == 0 else "error",
+            "detail": "" if r.returncode == 0 else "exit %d" % r.returncode}
+
+
+def _codex_dirs():
+    base = os.path.join(ROOT, "codex")
+    if not os.path.isdir(base):
+        return []
+    return [os.path.join(base, n) for n in sorted(os.listdir(base))
+            if os.path.isdir(os.path.join(base, n))]
+
+
+def sync_codex(min_gap=MANUAL_MIN_GAP):
+    dirs = _codex_dirs()
+    with cf.ThreadPoolExecutor(max_workers=4) as ex:
+        results = list(ex.map(lambda d: probe_codex(d, min_gap), dirs))
+    return {os.path.basename(d): res for d, res in zip(dirs, results)}
+
+
+def codex_due(d):
+    """Due when its newest recorded run is 60+ minutes old. Keying on the data's
+    real age means a server restart does not spend quota, and a manual Sync
+    pushes the next automatic refresh back an hour."""
+    import time
+    age_data = time.time() - (last_activity("codex", d) or 0)
+    age_probe = time.time() - _probe_last.get(d, 0)
+    # both must be old: a probe that fails to write a record must not retry every minute
+    return age_data >= AUTO_CODEX_SECONDS and age_probe >= AUTO_CODEX_SECONDS
+
+
+def start_login(tool, name, email=None):
+    """Launch the CLI's own OAuth flow and hand the URL back to the page."""
+    import threading, time
+    key = "%s/%s" % (tool, name)
+    d = os.path.join(ROOT, tool, name)
+    if not os.path.isdir(d):
+        return None, "no such account"
+    prev = _logins.get(key)
+    if prev and prev.get("proc") and prev["proc"].poll() is None:
+        return prev.get("url"), None      # already waiting; reuse its URL
+
+    bin_path = cli_bin(tool)
+    if not bin_path:
+        return None, "%s CLI not found" % tool
+    env = dict(os.environ)
+    if tool == "claude":
+        env["CLAUDE_CONFIG_DIR"] = d
+        cmd = [bin_path, "auth", "login", "--claudeai"]
+        if email:
+            cmd += ["--email", email]
+    else:
+        env["CODEX_HOME"] = d
+        cmd = [bin_path, "login"]
+
+    try:
+        # stdin stays OPEN: Claude's flow can ask for a code to be pasted, which
+        # happens whenever the browser does not finish the handshake itself (for
+        # example when signing in on another device).
+        proc = subprocess.Popen(cmd, env=env, stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, bufsize=1)
+    except Exception as e:
+        return None, str(e)[:60]
+
+    ent = {"proc": proc, "url": None, "started": time.time(),
+           "done": False, "error": None, "lines": []}
+    _logins[key] = ent
+
+    def pump():
+        import re
+        try:
+            for line in proc.stdout:
+                ent["lines"].append(line.rstrip())
+                if not ent["url"]:
+                    m = re.search(r"https://\S*(oauth/authorize|cai/oauth)\S*", line)
+                    if m:
+                        ent["url"] = m.group(0).rstrip('.,)')
+        except Exception:
+            pass
+        proc.wait()
+        ent["done"] = True
+        if proc.returncode != 0:
+            ent["error"] = "login exited %d" % proc.returncode
+
+    threading.Thread(target=pump, daemon=True).start()
+    for _ in range(60):                     # wait briefly for the URL to appear
+        if ent["url"] or ent["done"]:
+            break
+        time.sleep(0.25)
+    return ent.get("url"), ent.get("error")
+
+
+def submit_login_code(tool, name, code):
+    """Feed a pasted authorization code to the waiting login process."""
+    import re
+    key = "%s/%s" % (tool, name)
+    ent = _logins.get(key)
+    if not ent or not ent.get("proc"):
+        return False, "no sign-in is waiting for this account"
+    proc = ent["proc"]
+    if proc.poll() is not None:
+        return False, "that sign-in already finished - start a new one"
+    code = (code or "").strip()
+    if not code:
+        return False, "paste the code first"
+
+    # The code carries the attempt's state after '#'. Checking it here turns a
+    # silent failure into a clear message.
+    want = re.search(r"state=([^&]+)", ent.get("url") or "")
+    got = code.split("#", 1)[1] if "#" in code else None
+    if want and got and want.group(1) != got:
+        return False, ("that code is from a different sign-in attempt "
+                       "(expected ...%s, got ...%s)" % (want.group(1)[-8:], got[-8:]))
+    try:
+        proc.stdin.write(code + "\n")
+        proc.stdin.flush()
+    except Exception as e:
+        return False, "could not deliver the code: %s" % str(e)[:40]
+    return True, "code submitted"
+
+
+def login_state(tool, name):
+    d = os.path.join(ROOT, tool, name)
+    key = "%s/%s" % (tool, name)
+    ent = _logins.get(key) or {}
+    if tool == "claude":
+        who = claude_identity(d)
+        signed = bool(keychain_token(d))
+    else:
+        who = codex_identity(d)
+        signed = os.path.exists(os.path.join(d, "auth.json"))
+    waiting = bool(ent.get("proc") and not ent.get("done"))
+    return {"signedIn": signed, "email": who, "url": ent.get("url"),
+            "waiting": waiting, "canPasteCode": waiting and bool(ent.get("url")),
+            "error": ent.get("error")}
+
+
+def meta_for(a, live=False, ts=None):
+    import datetime
+    when = datetime.datetime.fromtimestamp(ts) if ts else datetime.datetime.now()
+    return {"period": a.period, "since": a.since or "", "until": a.until or "",
+            "generated": when.strftime("%H:%M:%S" if live else "%Y-%m-%d %H:%M"),
+            "live": bool(live), "interval": getattr(a, "interval", 60)}
+
+
+def build_html(rows, meta):
+    return HTML.replace("__DATA__", json.dumps(rows)).replace("__META__", json.dumps(meta))
+
+
+def render_html(rows, path, a):
+    path = os.path.expanduser(path)
+    with open(path, "w") as fh:
+        fh.write(build_html(rows, meta_for(a)))
+    return path
+
+
+def _with_limits(entries, rows):
+    for e, r in zip(entries, rows):
+        if not isinstance(r, dict):
+            continue
+        # An excluded account must not leak its quota either — the exclusion is
+        # about the account, not merely about its token totals.
+        if str(r.get("skipped") or "").startswith("excluded"):
+            r["limits"] = None
+            continue
+        if r.get("limits") is None:
+            r["limits"] = limits_for(e[1], e[2])
+    return rows
+
+
+def scan(a):
+    entries = discover(a.legacy, a.include_excluded)
+    with cf.ThreadPoolExecutor(max_workers=4) as ex:
+        rows = list(ex.map(lambda e: run_one(e, a.period, a.since, a.until), entries))
+    return _with_limits(entries, rows)
+
+
+def serve(a, port):
+    """Local dashboard that refreshes itself. Bound to loopback only: usage and
+    cost figures never leave the machine."""
+    import http.server, threading, time
+    cache = {"rows": None, "t": 0.0}
+    lock = threading.Lock()
+
+    def rows_now(force=False):
+        with lock:
+            if force:
+                # A manual sync clears the poll floor so it actually refetches,
+                # but NOT an active 429 backoff - forcing through that is what
+                # keeps the limit tripped.
+                now_ = time.time()
+                for ent in _usage_cache.values():
+                    if ent.get("stale_reason") and "Rate Limit" in str(ent["stale_reason"]):
+                        continue
+                    ent["next_ok"] = 0
+            if force or cache["rows"] is None or time.time() - cache["t"] > a.interval:
+                cache["rows"] = scan(a)
+                cache["t"] = time.time()
+            return cache["rows"], cache["t"]
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def _send(self, body, ctype):
+            body = body.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            if self.path.startswith("/data.json"):
+                rows, t = rows_now("force=1" in self.path)
+                self._send(json.dumps({"rows": rows, "meta": meta_for(a, True, t)}),
+                           "application/json")
+            elif self.path in ("/", "/index.html"):
+                rows, t = rows_now()
+                self._send(build_html(rows, meta_for(a, True, t)), "text/html; charset=utf-8")
+            else:
+                self.send_error(404)
+
+        def do_POST(self):
+            import urllib.parse
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(n).decode() or "{}")
+            except Exception:
+                self._send(json.dumps({"ok": False, "error": "bad request"}),
+                           "application/json"); return
+
+            path = urllib.parse.urlparse(self.path).path
+            tool = (body.get("tool") or "").strip()
+            name = (body.get("name") or "").strip()
+            out = {"ok": False, "error": "unknown endpoint"}
+
+            if path == "/api/add":
+                ok, res = add_profile(tool, name)
+                out = {"ok": ok, "error": None if ok else res,
+                       "dir": res if ok else None}
+                if ok:
+                    cache["rows"] = None          # force a rescan
+            elif path == "/api/login":
+                url, err = start_login(tool, name, (body.get("email") or "").strip() or None)
+                out = {"ok": bool(url) and not err, "url": url, "error": err}
+            elif path == "/api/sync":
+                if tool not in ("", "claude", "codex"):
+                    out = {"ok": False, "error": "unknown tool"}
+                else:
+                    # Syncing one platform must not spend the other's quota:
+                    # Codex probes run only for codex/all, and Claude's poll
+                    # floors are cleared only for claude/all.
+                    results = sync_codex() if tool in ("", "codex") else {}
+                    with lock:
+                        cache["rows"] = None
+                        if tool in ("", "claude"):
+                            for ent in _usage_cache.values():
+                                if ent.get("stale_reason") and "Rate Limit" in str(ent["stale_reason"]):
+                                    continue
+                                ent["next_ok"] = 0
+                    out = {"ok": True, "tool": tool or "all", "codex": results}
+            elif path == "/api/remove":
+                ok, res = remove_profile(tool, name)
+                out = {"ok": ok, "error": None if ok else res,
+                       "removed": res if ok else None}
+                if ok:
+                    cache["rows"] = None
+            elif path == "/api/login-code":
+                ok, msg = submit_login_code(tool, name, body.get("code"))
+                out = {"ok": ok, "error": None if ok else msg}
+            elif path == "/api/login-state":
+                if tool in ("claude", "codex") and _valid_name(name):
+                    out = dict(login_state(tool, name)); out["ok"] = True
+                    cache["rows"] = None
+                else:
+                    out = {"ok": False, "error": "bad account"}
+            self._send(json.dumps(out), "application/json")
+
+    _cache_load()
+
+    def codex_auto_loop():
+        import time
+        while True:
+            try:
+                due = [d for d in _codex_dirs() if codex_due(d)]
+                if due:
+                    with cf.ThreadPoolExecutor(max_workers=4) as ex:
+                        list(ex.map(lambda d: probe_codex(d, AUTO_CODEX_SECONDS), due))
+                    with lock:
+                        cache["rows"] = None
+            except Exception:
+                pass
+            time.sleep(60)
+    threading.Thread(target=codex_auto_loop, daemon=True).start()
+    # Stagger the first poll so a restart does not fire every account at once.
+    import time as _t
+    for i, key in enumerate(sorted(_usage_cache)):
+        _usage_cache[key]["next_ok"] = _t.time() + i * 15
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    url = "http://127.0.0.1:%d" % port
+    print("live dashboard: %s" % url)
+    n = len([x for x in (discover(a.legacy, a.include_excluded)) if x[1] == "claude"])
+    print("  screen refresh every %ds \u00b7 API poll at most every %ds per account"
+          % (a.interval, MIN_POLL_SECONDS))
+    print("  \u2248 %.1f API calls/min across %d Claude accounts \u00b7 Ctrl-C to stop"
+          % (n * 60.0 / MIN_POLL_SECONDS, n))
+    if a.do_open:
+        threading.Timer(0.6, lambda: subprocess.run(["open", url], check=False)).start()
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print("\nstopped")
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Per-account Claude Code + Codex usage")
+    ap.add_argument("--period", default="daily", choices=["daily", "weekly", "monthly", "session"])
+    ap.add_argument("--since")
+    ap.add_argument("--until")
+    ap.add_argument("--json", action="store_true", dest="as_json")
+    ap.add_argument("--legacy", action="store_true",
+                    help="also include the default ~/.claude slot (off by default: it duplicates whichever account is signed into it)")
+    ap.add_argument("--include-excluded", action="store_true", help="also count excluded accounts")
+    ap.add_argument("--whoami", action="store_true", help="show which account each profile is logged into")
+    ap.add_argument("--limits", action="store_true",
+                    help="show 5-hour and weekly quota usage per account")
+    ap.add_argument("--refresh", metavar="ACCOUNT",
+                    help="force a token refresh for that account (test/repair)")
+    ap.add_argument("--capture", metavar="ACCOUNT",
+                    help="store the Keychain credential into that account's profile")
+    ap.add_argument("--expect", metavar="EMAIL",
+                    help="the account the captured token MUST belong to")
+    ap.add_argument("--auth", action="store_true",
+                    help="LIVE auth check per account (asks each CLI, not the config file)")
+    ap.add_argument("--html", nargs="?", const=os.path.join(ROOT, "dashboard.html"),
+                    help="render a local dashboard (default: ~/.ai-accounts/dashboard.html)")
+    ap.add_argument("--open", action="store_true", dest="do_open", help="open the dashboard after writing it")
+    ap.add_argument("--serve", nargs="?", const=8787, type=int, metavar="PORT",
+                    help="run a live dashboard on 127.0.0.1 (default port 8787)")
+    ap.add_argument("--interval", type=int, default=10,
+                    help="seconds between screen refreshes (default 10; costs no API calls)")
+    ap.add_argument("--poll", type=int, default=MIN_POLL_SECONDS, metavar="SECONDS",
+                    help="minimum seconds between API polls PER ACCOUNT (default %d)" % MIN_POLL_SECONDS)
+    a = ap.parse_args()
+
+    if a.refresh:
+        import time
+        d = os.path.join(ROOT, "claude", a.refresh)
+        if not os.path.isdir(d):
+            print("no such profile: %s" % d, file=sys.stderr); return 2
+        before = keychain_token(d)
+        if not before:
+            print("not signed in", file=sys.stderr); return 1
+        who_b, _e = token_owner(before)
+        print("  before: %s  expires in %.1f h" % (
+            (who_b or {}).get("email"),
+            ((before.get("expiresAt") or 0)/1000 - time.time())/3600))
+        fresh, err = refresh_token(d, before)
+        if not fresh:
+            print("  REFRESH FAILED: %s" % err, file=sys.stderr); return 1
+        if not keychain_write(d, fresh):
+            print("  refreshed but could not write to Keychain", file=sys.stderr); return 1
+        who_a, err2 = token_owner(fresh)
+        print("  after : %s  expires in %.1f h" % (
+            (who_a or {}).get("email") or ("ERROR " + str(err2)),
+            ((fresh.get("expiresAt") or 0)/1000 - time.time())/3600))
+        print("  refresh token rotated:", before.get("refreshToken") != fresh.get("refreshToken"))
+        return 0
+
+    if a.capture:
+        if a.expect:
+            EXPECT[a.capture] = a.expect
+        return capture(a.capture)
+
+    if a.auth:
+        return auth_check()
+
+    if a.poll and a.poll != MIN_POLL_SECONDS:
+        globals()["MIN_POLL_SECONDS"] = max(15, a.poll)
+
+    if a.serve:
+        return serve(a, a.serve)
+
+    entries = discover(a.legacy, a.include_excluded)
+
+    if a.whoami:
+        print("%-12s %-7s %-34s %s" % ("ACCOUNT", "TOOL", "LOGGED IN AS", "STATUS"))
+        for label, tool, d, email, skip in entries:
+            status = skip or ("logged in" if email else "not logged in yet")
+            print("%-12s %-7s %-34s %s" % (label, tool, email or "-", status))
+        return 0
+
+    if a.limits:
+        print("%-12s %-7s %-16s %5s  %-10s %-17s %s" % (
+            "ACCOUNT", "TOOL", "WINDOW", "USED", "", "RESETS", "AS OF"))
+        print("-" * 96)
+        shown = False
+        for label, tool, d, email, skip in entries:
+            if skip and skip.startswith("excluded"):
+                continue
+            lim = limits_for(tool, d)
+            if not lim or not lim.get("windows"):
+                if tool == "codex":
+                    signed = os.path.exists(os.path.join(d, "auth.json"))
+                else:
+                    signed = bool(keychain_token(d))
+                msg = ("signed in \u2014 no usage recorded yet (run it once)" if signed
+                       else "not signed in yet")
+                print("%-12s %-7s %s" % (label, tool, msg))
+                continue
+            for w in lim["windows"]:
+                shown = True
+                mark = "*" if str(w.get("inferred", "")).startswith("window reset") else " "
+                sev = w.get("severity")
+                flag = " !" if sev == "critical" else ""
+                print("%-12s %-7s %-16s %4d%%%s %s %-17s %s%s" % (
+                    label, tool, w["label"], round(w["pct"]), mark,
+                    gauge(w["pct"], 10),
+                    "reset" if mark == "*" else fmt_reset(w["resets"]),
+                    fmt_age(lim["as_of"]), flag))
+        if shown:
+            print()
+            print("  USED matches Claude Code's Account & Usage panel.")
+            print("  'just now' = polled live from the API with that account's own")
+            print("  token. An older AS OF means no token stored yet, so the figure")
+            print("  comes from a local cache. ! = critical. * = window already reset.")
+        return 0
+
+    with cf.ThreadPoolExecutor(max_workers=4) as ex:
+        rows = list(ex.map(lambda e: run_one(e, a.period, a.since, a.until), entries))
+    rows = _with_limits(entries, rows)
+
+    if a.as_json:
+        print(json.dumps({"rows": rows}, indent=2))
+        return 0
+
+    if a.html:
+        path = render_html(rows, a.html, a)
+        print("dashboard written: %s" % path)
+        if a.do_open:
+            subprocess.run(["open", path], check=False)
+        return 0
+
+    active = [r for r in rows if not r.get("skipped")]
+    active.sort(key=lambda r: -r.get("cost", 0))
+    print("%-12s %-7s %10s %10s %12s" % ("ACCOUNT", "TOOL", "TOKENS", "CACHED", "COST"))
+    print("-" * 55)
+    for r in active:
+        print("%-12s %-7s %10s %10s %12s" % (
+            r["label"], r["tool"], human(r["tokens"]), human(r["cacheRead"]),
+            "$%.2f" % r["cost"]))
+    print("-" * 55)
+    print("%-12s %-7s %10s %10s %12s" % (
+        "TOTAL", "", human(sum(r["tokens"] for r in active)),
+        human(sum(r["cacheRead"] for r in active)),
+        "$%.2f" % sum(r["cost"] for r in active)))
+    for r in rows:
+        if r.get("skipped"):
+            print("  skipped %s/%s: %s" % (r["label"], r["tool"], r["skipped"]), file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

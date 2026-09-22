@@ -1,0 +1,14 @@
+# Account credentials and runtime state. Never commit these directories.
+/claude/
+/codex/
+
+# Generated usage output and local server state.
+/.usage-cache.json
+/dashboard.html
+/server.log
+
+# Local backups and OS/editor artifacts.
+*.bak.*
+.DS_Store
+__pycache__/
+*.py[cod]

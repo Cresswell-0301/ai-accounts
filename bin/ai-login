@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# ai-login <claude|codex> <account> [expected-email]
+#
+# Signs an account into ITS OWN profile dir, then VERIFIES which account
+# actually arrived. The CLI reports "Login successful" even when the browser's
+# existing session authorized a different account than you asked for, so the
+# check after the login is the point of this script.
+set -u
+tool="${1:-}"; acct="${2:-}"; want="${3:-}"
+if [ -z "$tool" ] || [ -z "$acct" ]; then
+  echo "usage: ai-login <claude|codex> <account> [expected-email]" >&2; exit 2
+fi
+root="$HOME/.ai-accounts/$tool/$acct"
+[ -d "$root" ] || { echo "no such profile: $root" >&2; exit 2; }
+
+newest() { find "$HOME/.vscode/extensions" -maxdepth 1 -type d -name "$1" 2>/dev/null | sort -V | tail -1; }
+if [ "$tool" = claude ]; then
+  bin="$(newest 'anthropic.claude-code-*-darwin-*')/resources/native-binary/claude"
+else
+  bin="$(newest 'openai.chatgpt-*-darwin-*')/bin/macos-aarch64/codex"
+fi
+[ -x "$bin" ] || { echo "CLI not found for $tool" >&2; exit 1; }
+
+who() {
+  if [ "$tool" = claude ]; then
+    python3 -c "
+import json,sys
+try: print((json.load(open('$root/.claude.json')).get('oauthAccount') or {}).get('emailAddress') or '')
+except Exception: print('')
+"
+  else
+    python3 -c "
+import json,base64
+try:
+    t=json.load(open('$root/auth.json'))['tokens']['id_token'].split('.')[1]
+    t+='='*(-len(t)%4)
+    print(json.loads(base64.urlsafe_b64decode(t)).get('email') or '')
+except Exception: print('')
+"
+  fi
+}
+
+cat <<BANNER
+
+  Signing in: $acct  ($tool)
+  Target dir: $root
+  ${want:+Expecting : $want}
+
+  IMPORTANT: open the URL in a PRIVATE / INCOGNITO window, or sign out of
+  your browser session first. Otherwise it authorizes whichever account the
+  browser is already signed into, and silently reports success.
+
+BANNER
+
+if [ "$tool" = claude ]; then
+  CLAUDE_CONFIG_DIR="$root" "$bin" auth login --claudeai ${want:+--email "$want"}
+else
+  CODEX_HOME="$root" "$bin" login
+fi
+
+got="$(who)"
+echo
+if [ -z "$got" ]; then
+  echo "  RESULT: nothing landed in $root — login did not complete."
+  exit 1
+fi
+if [ -n "$want" ] && [ "$got" != "$want" ]; then
+  echo "  ⚠ WRONG ACCOUNT: got '$got', expected '$want'"
+  echo "    The browser session overrode the request. To retry cleanly:"
+  echo "      rm -rf '$root' && mkdir -p '$root'"
+  echo "      ai-login $tool $acct $want      # then use a PRIVATE window"
+  exit 1
+fi
+echo "  ✓ $acct is signed in as $got"
+echo "  Verify everything:  ai-usage --auth"

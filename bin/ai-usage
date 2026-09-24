@@ -217,7 +217,10 @@ overflow:hidden;min-width:74px}
 .renew{white-space:nowrap;color:var(--mut);font-size:12.5px}
 .renew b{display:block;color:var(--ink);font-weight:500;font-size:13px}
 .empty{color:var(--mut);text-align:center;padding:26px 0}
-td.msg{text-align:center;color:var(--mut)}
+td.badge-dead{display:inline-block;margin-left:8px;padding:1px 7px;border-radius:10px;background:#7f1d1d;color:#fecaca;font-size:11px;font-weight:600;vertical-align:middle}
+.badge-stale{display:inline-block;margin-left:8px;padding:1px 7px;border-radius:10px;background:#78350f;color:#fde68a;font-size:11px;font-weight:600;vertical-align:middle}
+.rowstale td:not(.acct){opacity:.45}
+.msg{text-align:center;color:var(--mut)}
 .note{color:var(--mut);font-size:12px;margin-top:14px}
 .warnbadge{color:var(--bad);font-weight:700;margin-left:5px}
 .addrow{display:flex;gap:8px;flex-wrap:wrap;margin-top:16px;align-items:center}
@@ -338,15 +341,11 @@ function cell(w) {
 }
 
 function sectionSync(rows) {
-  // The OLDEST reading among HEALTHY rows: a healthy account that has quietly
-  // gone stale still shows here. Rows with an error (blocked, expired) are
-  // already labelled on their own line, so they are counted, not averaged in -
-  // otherwise one blocked account makes the whole section look 18h stale.
-  const healthy = rows.filter(r => r.limits && (r.limits.windows || []).length
-                                   && r.limits.as_of && !r.limits.error);
-  const failing = rows.filter(r => r.limits && r.limits.error).length;
-  const ts = healthy.map(r => r.limits.as_of);
-  if (!ts.length) return failing ? failing + " not reporting" : "";
+  // The OLDEST reading in the section: every row in it is at least this fresh.
+  // Showing the newest would hide one account that has quietly gone stale.
+  const ts = rows.filter(r => r.limits && (r.limits.windows || []).length && r.limits.as_of)
+                 .map(r => r.limits.as_of);
+  if (!ts.length) return "";
   const t = Math.min.apply(null, ts);
   const d = new Date(t * 1000);
   const mins = Math.max(0, Math.floor((Date.now() - t * 1000) / 60000));
@@ -355,8 +354,7 @@ function sectionSync(rows) {
   const clock = mins < 1440
     ? d.toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"})
     : d.toLocaleDateString([], {weekday: "short", day: "numeric", month: "short"});
-  return "Synced " + clock + " \u00b7 " + rel +
-    (failing ? " \u00b7 " + failing + " not reporting" : "");
+  return "Synced " + clock + " \u00b7 " + rel;
 }
 
 function relDays(ts) {
@@ -406,6 +404,24 @@ const find = (wins, kind) => (wins || []).find(w => w.kind === kind);
 function render() {
   $("sub").innerHTML = META.live ? '<span class="dot"></span>Live' : "generated " + META.generated;
 
+  const staleTag = (r) => {
+    // Age is ground truth (r.limits.live is unreliable). Thresholds depend on
+    // how often that tool is polled: Claude every ~2min, Codex only hourly by
+    // design, so 18min old is FRESH for Codex but stale for Claude.
+    const L = r.limits || {};
+    const a = L.as_of;
+    if (!a) return "";
+    const mins = (Date.now()/1000 - a) / 60;
+    const codex = r.tool === "codex";
+    const freshUntil = codex ? 75 : 15;      // hourly + margin vs 2min poll
+    const deadAfter  = codex ? 1440 : 180;   // Codex: only flag after a full day
+    if (mins < freshUntil) return "";
+    if (mins >= deadAfter)
+      return '<span class="badge-dead">re-sign in needed</span>';
+    const h = mins/60;
+    return '<span class="badge-stale">stale \u00b7 ' +
+      (h >= 1 ? Math.round(h) + "h" : Math.round(mins) + "m") + ' old</span>';
+  };
   const cc = DATA.filter(r => r.tool === "claude");
   $("cc").innerHTML = cc.length ? cc.map(r => {
     const wins = (r.limits && r.limits.windows) || [];
@@ -416,7 +432,8 @@ function render() {
     }
     const sess = find(wins, "session"), week = find(wins, "weekly_all"),
           fab = wins.find(w => w.kind === "weekly_scoped");
-    return `<tr><td class="acct">${r.label}<small>${r.email || ""}</small></td>
+    const st = staleTag(r);
+    return `<tr class="${st ? "rowstale" : ""}"><td class="acct">${r.label}<small>${r.email || ""}${st}</small></td>
       ${cell(sess)}<td class="renew">${rtime(sess, "session")}</td>
       ${cell(week)}<td class="renew">${rtime(week, "weekly")}</td>
       ${cell(fab)}${actions(r)}</tr>`;
@@ -438,7 +455,9 @@ function render() {
       ? '<div class="mut">' + wins.slice(1).map(x =>
           x.label + " " + Math.round(x.pct) + "%").join(" \u00b7 ") + "</div>"
       : "";
-    return `<tr>${head}${cell(w)}
+    const st = staleTag(r);
+    const head2 = `<td class="acct">${r.label}<small>${r.email || ""}${plan ? " \u00b7 " + plan : ""}${st}</small></td>`;
+    return `<tr class="${st ? "rowstale" : ""}">${head2}${cell(w)}
       <td class="renew"><b>${when(w.resets, w.inferred)}</b>${relDays(w.resets)}${extra}</td>
       ${actions(r)}</tr>`;
   }).join("") : '<tr><td colspan="4" class="empty">No Codex accounts configured.</td></tr>';
@@ -789,8 +808,26 @@ def refresh_token(config_dir, blob):
     return fresh, None
 
 
+import threading as _threading
+_refresh_locks = {}
+_refresh_locks_guard = _threading.Lock()
+
+
+def _refresh_lock(config_dir):
+    with _refresh_locks_guard:
+        lk = _refresh_locks.get(config_dir)
+        if lk is None:
+            lk = _refresh_locks[config_dir] = _threading.Lock()
+        return lk
+
+
 def token_for(config_dir):
-    """The credential to use now, refreshed first if it is about to expire."""
+    """The credential to use now, refreshed first if it is about to expire.
+
+    A refresh is DESTRUCTIVE: the server consumes the old refresh token and
+    issues a new one, so the new token MUST be persisted or the account is dead.
+    Serialise per account (concurrent refresh = the second thread sends an
+    already-consumed token) and verify the write, retrying, before trusting it."""
     import time
     blob = keychain_token(config_dir)
     if not blob:
@@ -798,11 +835,26 @@ def token_for(config_dir):
     exp = (blob.get("expiresAt") or 0) / 1000.0
     if exp and exp - time.time() > REFRESH_MARGIN:
         return blob, None
-    fresh, err = refresh_token(config_dir, blob)
-    if not fresh:
-        return blob, "refresh failed: %s" % err
-    keychain_write(config_dir, fresh)
-    return fresh, None
+
+    with _refresh_lock(config_dir):
+        # Re-read inside the lock: another thread may have just refreshed.
+        blob = keychain_token(config_dir) or blob
+        exp = (blob.get("expiresAt") or 0) / 1000.0
+        if exp and exp - time.time() > REFRESH_MARGIN:
+            return blob, None
+
+        fresh, err = refresh_token(config_dir, blob)
+        if not fresh:
+            return blob, "refresh failed: %s" % err
+
+        # The old token is now consumed; persist the new one or it is lost.
+        for _ in range(3):
+            if keychain_write(config_dir, fresh):
+                return fresh, None
+            time.sleep(0.3)
+        # Wrote nowhere durable but hold the fresh token in memory for THIS run
+        # so the poll still succeeds; next start re-reads the (stale) Keychain.
+        return fresh, "token refreshed but Keychain write failed"
 
 
 def keychain_service(config_dir=None):
@@ -846,25 +898,10 @@ def live_claude_usage(blob):
         with urllib.request.urlopen(req, timeout=30) as r:
             doc = json.loads(r.read().decode())
     except urllib.error.HTTPError as e:
-        if e.code == 429:
-            # Anthropic states the penalty; retrying inside it just extends it.
-            ra = e.headers.get("retry-after") if e.headers else None
-            try:
-                ra = int(float(ra)) if ra else 0
-            except ValueError:
-                ra = 0
-            return None, "Rate Limit|%d" % ra
         if e.code in (401, 403):
-            # A 403 can be the ORG refusing OAuth, not an expired token; read
-            # the body so the row says which, since the fixes are different.
-            try:
-                body = json.loads(e.read().decode())
-                msg = ((body.get("error") or {}).get("message") or "")
-            except Exception:
-                msg = ""
-            if "not allowed for this organization" in msg:
-                return None, "Blocked by organization"
             return None, "token expired \u2014 re-login"
+        if e.code == 429:
+            return None, "Rate Limit"
         return None, "HTTP %d" % e.code
     except Exception as e:
         return None, str(e)[:40]
@@ -952,17 +989,7 @@ def cached_usage(d, blob):
         return wins, now, None
 
     reason = err or "fetch failed"
-    wait = MIN_POLL_SECONDS
-    if str(err).startswith("Rate Limit"):
-        ra = 0
-        if "|" in str(err):
-            try:
-                ra = int(str(err).split("|", 1)[1])
-            except ValueError:
-                ra = 0
-        # honour the server's retry-after (+ a margin); never shorter than our floor
-        wait = max(BACKOFF_SECONDS, ra + 60)
-        reason = "Rate Limit" + (" \u00b7 retry in %dm" % max(1, wait // 60))
+    wait = BACKOFF_SECONDS if "Rate Limit" in str(err) else MIN_POLL_SECONDS
     if ent and ent.get("windows"):
         ent["next_ok"] = now + wait
         ent["stale_reason"] = reason

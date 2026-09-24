@@ -1,14 +1,18 @@
-# Account credentials and runtime state. Never commit these directories.
+# Account data & secrets — NEVER commit
 /claude/
 /codex/
+auth.json
+token.json
+.claude.json
+.credentials.json
 
-# Generated usage output and local server state.
-/.usage-cache.json
+# Runtime state / generated
 /dashboard.html
 /server.log
+*.log
+/.usage-cache.json
+*.fifo
 
-# Local backups and OS/editor artifacts.
-*.bak.*
-.DS_Store
-__pycache__/
-*.py[cod]
+# Local backups of the script
+bin/*.bak.*
+bin/*.today-ui.*

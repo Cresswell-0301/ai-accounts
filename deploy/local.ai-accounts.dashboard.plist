@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>local.ai-accounts.dashboard</string>
+
+  <!-- AI usage dashboard: http://127.0.0.1:8787 -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/nexflo/.local/bin/python3.12</string>
+    <string>/Users/nexflo/.ai-accounts/bin/ai-usage</string>
+    <string>--serve</string>
+    <string>8787</string>
+    <string>--interval</string>
+    <string>10</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/nexflo/.ai-accounts</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>/Users/nexflo</string>
+    <key>PATH</key>
+    <string>/Users/nexflo/.nvm/versions/node/v24.18.0/bin:/Users/nexflo/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+
+  <!-- start at login, restart if it exits; wait 30s between restarts -->
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+
+  <key>StandardOutPath</key>
+  <string>/Users/nexflo/.ai-accounts/server.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/nexflo/.ai-accounts/server.log</string>
+</dict>
+</plist>

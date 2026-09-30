@@ -20,3 +20,5 @@ bin/*.today-ui.*
 # python bytecode
 __pycache__/
 *.pyc
+/notify.json
+/.suggest-exclude.json

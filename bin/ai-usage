@@ -325,7 +325,7 @@ color:var(--mut);font-weight:600;margin-bottom:5px}
 </div></div>
 </div>
 <script>
-let DATA = __DATA__, META = __META__;
+let DATA = __DATA__, META = __META__, EXCLUDED = __EXCLUDED__;
 const $ = id => document.getElementById(id);
 const colour = w => (w.severity === "critical" || w.pct >= 90) ? "var(--bad)"
                   : (w.severity === "warning" || w.pct >= 70) ? "var(--warn)" : "var(--ok)";
@@ -410,20 +410,18 @@ function sectionSync(rows) {
 // Which account to reach for right now, and a per-account opt-out for the ones
 // you only MONITOR (e.g. a shared account another team actually uses).
 
-const SUGGEST_EXCLUDE_KEY = "ai-usage:suggest-exclude";
 // Stable per-account id: email if we have it (survives a re-login that keeps the
 // same slot), else the label. Namespaced by tool so a claude/codex pair can't clash.
 function accountKey(r) { return r.tool + ":" + (r.email || r.label); }
-function excludedSet() {
-  try { return new Set(JSON.parse(localStorage.getItem(SUGGEST_EXCLUDE_KEY) || "[]")); }
-  catch (e) { return new Set(); }
-}
+// The opt-out list is SERVER-persisted (EXCLUDED, injected into the page) so the
+// Discord notifier and every browser agree on which accounts to leave out of the
+// suggestion. The checkbox updates it optimistically and POSTs to save it.
+function excludedSet() { try { return new Set(EXCLUDED); } catch (e) { return new Set(); } }
 function setExcluded(key, excluded) {
-  try {
-    const s = excludedSet();
-    if (excluded) s.add(key); else s.delete(key);
-    localStorage.setItem(SUGGEST_EXCLUDE_KEY, JSON.stringify(Array.from(s)));
-  } catch (e) {}
+  const s = excludedSet();
+  if (excluded) s.add(key); else s.delete(key);
+  EXCLUDED = Array.from(s);
+  post("/api/suggest-exclude", { key: key, excluded: excluded }).catch(() => {});
 }
 
 // The window closest to its limit is what walls you off first \u2014 session resets
@@ -1892,7 +1890,9 @@ def meta_for(a, live=False, ts=None):
 
 
 def build_html(rows, meta):
-    return HTML.replace("__DATA__", json.dumps(rows)).replace("__META__", json.dumps(meta))
+    return (HTML.replace("__DATA__", json.dumps(rows))
+                .replace("__META__", json.dumps(meta))
+                .replace("__EXCLUDED__", json.dumps(sorted(load_excludes()))))
 
 
 def render_html(rows, path, a):
@@ -1923,6 +1923,205 @@ def scan(a):
     return _with_limits(entries, rows)
 
 
+# ── Discord notification ──────────────────────────────────────────────────────
+# When a session or weekly window crosses the threshold (default 90%), post one
+# message to a Discord webhook with every account's usage and the suggested
+# account to use next. The webhook URL is a SECRET: it lives in a gitignored
+# local config, never in this file, so nothing sensitive is pushed.
+
+NOTIFY_CONFIG = os.path.join(ROOT, "notify.json")     # {"discord_webhook": "...", "threshold": 90}
+EXCLUDE_FILE = os.path.join(ROOT, ".suggest-exclude.json")   # accounts opted out of the suggestion
+_notified = set()          # (accountKey, window kind) already alerted while still over the threshold
+_notify_guard = _threading.Lock()
+
+
+def _notify_config():
+    try:
+        with open(NOTIFY_CONFIG) as fh:
+            return json.load(fh) or {}
+    except Exception:
+        return {}
+
+
+def discord_send(text):
+    """POST to the configured webhook. Discord answers 204 on success. No-op (and
+    False) when no webhook is set, so the feature is inert until configured."""
+    url = (_notify_config().get("discord_webhook") or "").strip()
+    if not url:
+        return False
+    import urllib.request, urllib.error
+    body = json.dumps({"content": text[:1990]}).encode()
+    req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return 200 <= r.status < 300
+    except Exception:
+        return False
+
+
+def load_excludes():
+    try:
+        with open(EXCLUDE_FILE) as fh:
+            return set(json.load(fh) or [])
+    except Exception:
+        return set()
+
+
+def save_excludes(keys):
+    try:
+        with open(EXCLUDE_FILE, "w") as fh:
+            json.dump(sorted(keys), fh)
+        return True
+    except Exception:
+        return False
+
+
+def account_key(row):
+    return (row.get("tool") or "") + ":" + (row.get("email") or row.get("label") or "")
+
+
+# Ported from the page's suggestion logic so the notifier picks the SAME account
+# the dashboard would. See the `recommend`/`rowState` JS for the rationale.
+def _row_state(row):
+    import time
+    L = row.get("limits") or {}
+    err = str(L.get("error") or "")
+    if any(k in err for k in ("re-login", "invalid_grant", "not signed in")):
+        return "dead"
+    a = L.get("as_of")
+    mins = (time.time() - a) / 60 if a else None
+    if "Rate Limit" in err:
+        return "ratelimited"
+    if mins is None:
+        return "nodata"
+    codex = row.get("tool") == "codex"
+    fresh_until, dead_after = (75, 1440) if codex else (15, 180)
+    if mins < fresh_until:
+        return "fresh"
+    if mins >= dead_after:
+        return "dead"
+    return "stale"
+
+
+def _binding_window(row):
+    best = None
+    for w in ((row.get("limits") or {}).get("windows") or []):
+        p = w.get("pct")
+        if isinstance(p, (int, float)) and (best is None or p > best["pct"]):
+            best = w
+    return best
+
+
+def _renew_window(row):
+    for w in ((row.get("limits") or {}).get("windows") or []):
+        if w.get("kind") == "weekly_all":
+            return w
+    return _binding_window(row)
+
+
+def _hours_until(w):
+    import time
+    r = w and w.get("resets")
+    return (r - time.time()) / 3600 if r else None
+
+
+def recommend_row(rows, excludes):
+    """Earliest weekly renew first among SAFE accounts (>= 10% headroom, not near a
+    limit, not excluded, fresh). Returns the chosen row's summary, or None."""
+    usable = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if account_key(row) in excludes:
+            continue
+        if _row_state(row) != "fresh":
+            continue
+        bw = _binding_window(row)
+        if not bw or (100 - bw["pct"]) < 10:
+            continue
+        usable.append(row)
+    if not usable:
+        return None
+
+    def sort_key(row):
+        h = _hours_until(_renew_window(row))
+        return (float("inf") if h is None else h, _binding_window(row)["pct"], row.get("label") or "")
+
+    best = min(usable, key=sort_key)
+    bw = _binding_window(best)
+    return {"label": best.get("label"), "left": round(100 - bw["pct"]), "hrs": _hours_until(_renew_window(best))}
+
+
+def _kind_label(kind):
+    return {"session": "session", "weekly_all": "weekly", "weekly_scoped": "weekly Fable"}.get(kind, kind or "limit")
+
+
+def _fmt_in(h):
+    if h is None:
+        return ""
+    return "in %dh" % max(0, round(h)) if h < 48 else "in %dd" % round(h / 24)
+
+
+def build_notify_message(rows, crossings, excludes):
+    alerts = ["**%s** %s at %d%%" % (r.get("label"), _kind_label(w.get("kind")), round(w["pct"])) for r, w in crossings]
+    out = [":warning: **AI Usage — limit almost hit**: " + ", ".join(alerts), ""]
+    for tool, title in (("claude", "Claude Code"), ("codex", "Codex")):
+        trows = [r for r in rows if isinstance(r, dict) and r.get("tool") == tool]
+        if not trows:
+            continue
+        out.append("**%s**" % title)
+        out.append("```")
+        if tool == "claude":
+            out.append("%-14s %5s %5s %5s" % ("account", "sess", "week", "fable"))
+            for r in trows:
+                wins = {w.get("kind"): w for w in ((r.get("limits") or {}).get("windows") or [])}
+                def pc(k):
+                    w = wins.get(k)
+                    return ("%d%%" % round(w["pct"])) if w and isinstance(w.get("pct"), (int, float)) else "-"
+                st = _row_state(r)
+                note = " re-sign in" if st == "dead" else (" rate-limited" if st == "ratelimited" else "")
+                out.append("%-14s %5s %5s %5s%s" % ((r.get("label") or "")[:14], pc("session"), pc("weekly_all"), pc("weekly_scoped"), note))
+        else:
+            out.append("%-14s %5s" % ("account", "usage"))
+            for r in trows:
+                bw = _binding_window(r)
+                out.append("%-14s %5s" % ((r.get("label") or "")[:14], ("%d%%" % round(bw["pct"])) if bw else "-"))
+        out.append("```")
+    for tool, title in (("claude", "Claude Code"), ("codex", "Codex")):
+        rec = recommend_row([r for r in rows if isinstance(r, dict) and r.get("tool") == tool], excludes)
+        if rec:
+            renew = _fmt_in(rec["hrs"])
+            out.append("**Use first (%s) → %s** — %d%% left%s" % (title, rec["label"], rec["left"], (", renews " + renew) if renew else ""))
+    return "\n".join(out)[:1990]
+
+
+def check_and_notify(rows):
+    """Edge-triggered: alert once when a window crosses the threshold, and not
+    again until it drops back below (e.g. after its reset)."""
+    global _notified
+    cfg = _notify_config()
+    if not (cfg.get("discord_webhook") or "").strip():
+        return
+    thr = cfg.get("threshold", 90)
+    with _notify_guard:
+        active, by_key = set(), {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            for w in ((row.get("limits") or {}).get("windows") or []):
+                p = w.get("pct")
+                if isinstance(p, (int, float)) and round(p) >= thr:
+                    k = (account_key(row), w.get("kind"))
+                    active.add(k)
+                    by_key[k] = (row, w)
+        new = active - _notified
+        _notified = active           # remember current; windows that dropped are forgotten
+        if not new:
+            return
+        crossings = [by_key[k] for k in new]
+    discord_send(build_notify_message(rows, crossings, load_excludes()))
+
+
 def serve(a, port):
     """Local dashboard that refreshes itself. Bound to loopback only: usage and
     cost figures never leave the machine."""
@@ -1944,6 +2143,10 @@ def serve(a, port):
             if force or cache["rows"] is None or time.time() - cache["t"] > a.interval:
                 cache["rows"] = scan(a)
                 cache["t"] = time.time()
+                # Check thresholds off the request path — a Discord POST must not
+                # block the page, and a webhook outage must not stall a refresh.
+                rows_snapshot = cache["rows"]
+                threading.Thread(target=check_and_notify, args=(rows_snapshot,), daemon=True).start()
             return cache["rows"], cache["t"]
 
     class Handler(http.server.BaseHTTPRequestHandler):
@@ -2024,6 +2227,15 @@ def serve(a, port):
                     cache["rows"] = None
                 else:
                     out = {"ok": False, "error": "bad account"}
+            elif path == "/api/suggest-exclude":
+                # Server-persisted so the browser checkboxes and the Discord
+                # notifier agree on which accounts to leave out of the suggestion.
+                key = (body.get("key") or "").strip()
+                ex = load_excludes()
+                if key:
+                    ex.add(key) if body.get("excluded") else ex.discard(key)
+                    save_excludes(ex)
+                out = {"ok": True, "excluded": sorted(ex)}
             self._send(json.dumps(out), "application/json")
 
     _cache_load()

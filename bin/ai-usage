@@ -439,36 +439,25 @@ function bindingWindow(r) {
 }
 function hoursUntil(epoch) { return epoch ? (epoch * 1000 - Date.now()) / 3600000 : null; }
 
-// Suggest the account to use NEXT so it will NOT hit a limit, and so budget that is
-// about to reset gets utilised rather than wasted. Pick the highest score of:
-//   - HEADROOM on the tightest window (100 - the most-used window's %): using the
-//     pick must not push it into its SESSION or WEEKLY limit, so the closer any one
-//     window is to full, the lower it scores; and
-//   - how SOON the WEEKLY budget renews: spend what is about to reset away first.
-// An account with < MIN_LEFT% left on ANY window is skipped outright (a 95% session
-// is too close to the wall, so the suggestion moves to another account).
+// Suggest the account to use NEXT by EARLIEST DEADLINE FIRST: the one whose WEEKLY
+// budget renews SOONEST, because budget not used before it renews is wasted. Two
+// guards frame that choice:
+//   - never a near-limit account: skip any with < MIN_LEFT% headroom on its
+//     tightest window, so using the pick can't push it into its SESSION or WEEKLY
+//     limit (a 95% session is passed over for another account); and
+//   - ties (same weekly renew) go to MORE headroom \u2014 safer, and more budget to
+//     actually spend before that shared reset.
+// Waste is a WEEKLY thing: a session refills every few hours, so its reset loses
+// nothing; urgency comes from the weekly renew only.
 //
 // Eligible = FRESH & measured (a dead/rate-limited/stale reading is not a number to
 // steer by), not opted out via its checkbox, and with >= MIN_LEFT% headroom on
 // every window.
 const MIN_LEFT = 10;
-const RENEW_HORIZON_H = 168;   // a weekly reset 7 days out adds no urgency; sooner adds up to +100
 
-// Waste happens at the WEEKLY reset \u2014 a session refills every few hours, so its
-// reset never loses anything. Urgency therefore comes from the weekly renew.
 function renewWindow(r) {
   const wins = (r.limits && r.limits.windows) || [];
   return wins.find(w => w.kind === "weekly_all") || bindingWindow(r);
-}
-
-function useScore(r) {
-  const bw = bindingWindow(r);           // the most-used window = the tightest limit
-  if (!bw) return -1;
-  const headroom = 100 - bw.pct;         // how far the account is from hitting a wall
-  const rw = renewWindow(r);
-  const h = rw ? hoursUntil(rw.resets) : null;
-  const renewSoon = h == null ? 0 : 100 * Math.max(0, Math.min(1, 1 - h / RENEW_HORIZON_H));
-  return headroom + renewSoon;           // safe to use + about to reset = use it first
 }
 
 function recommend(rows) {
@@ -482,8 +471,16 @@ function recommend(rows) {
   });
   if (!usable.length) return null;
   usable.sort((a, b) => {
-    const d = useScore(b) - useScore(a);
-    if (d) return d;
+    // 1) soonest weekly renew first \u2014 use it before it resets and is wasted.
+    //    An unknown reset time (no weekly window / no date) has no deadline, so it
+    //    sorts last.
+    const ha = hoursUntil(renewWindow(a) && renewWindow(a).resets);
+    const hb = hoursUntil(renewWindow(b) && renewWindow(b).resets);
+    const ra = ha == null ? Infinity : ha, rb = hb == null ? Infinity : hb;
+    if (ra !== rb) return ra - rb;
+    // 2) tie: more headroom first (lower usage on the tightest window).
+    const ua = bindingWindow(a).pct, ub = bindingWindow(b).pct;
+    if (ua !== ub) return ua - ub;
     return String(a.label).localeCompare(String(b.label));
   });
   const best = usable[0], bw = bindingWindow(best), rw = renewWindow(best);

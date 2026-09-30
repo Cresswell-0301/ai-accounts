@@ -439,16 +439,37 @@ function bindingWindow(r) {
 }
 function hoursUntil(epoch) { return epoch ? (epoch * 1000 - Date.now()) / 3600000 : null; }
 
-// The rule: suggest the account NEAREST its limit first \u2014 finish off the most-used
-// one before touching the fresh ones, so accounts fill up one at a time instead of
-// all sitting half-used \u2014 but NEVER suggest one with less than MIN_LEFT% remaining,
-// which is too close to the wall to be worth starting. Renew time breaks ties: of
-// two equally-used accounts, prefer the one resetting sooner (spend the budget that
-// would otherwise reset away first).
+// Suggest the account to use NEXT so it will NOT hit a limit, and so budget that is
+// about to reset gets utilised rather than wasted. Pick the highest score of:
+//   - HEADROOM on the tightest window (100 - the most-used window's %): using the
+//     pick must not push it into its SESSION or WEEKLY limit, so the closer any one
+//     window is to full, the lower it scores; and
+//   - how SOON the WEEKLY budget renews: spend what is about to reset away first.
+// An account with < MIN_LEFT% left on ANY window is skipped outright (a 95% session
+// is too close to the wall, so the suggestion moves to another account).
 //
 // Eligible = FRESH & measured (a dead/rate-limited/stale reading is not a number to
-// steer by), not opted out via its checkbox, and with >= MIN_LEFT% left.
+// steer by), not opted out via its checkbox, and with >= MIN_LEFT% headroom on
+// every window.
 const MIN_LEFT = 10;
+const RENEW_HORIZON_H = 168;   // a weekly reset 7 days out adds no urgency; sooner adds up to +100
+
+// Waste happens at the WEEKLY reset \u2014 a session refills every few hours, so its
+// reset never loses anything. Urgency therefore comes from the weekly renew.
+function renewWindow(r) {
+  const wins = (r.limits && r.limits.windows) || [];
+  return wins.find(w => w.kind === "weekly_all") || bindingWindow(r);
+}
+
+function useScore(r) {
+  const bw = bindingWindow(r);           // the most-used window = the tightest limit
+  if (!bw) return -1;
+  const headroom = 100 - bw.pct;         // how far the account is from hitting a wall
+  const rw = renewWindow(r);
+  const h = rw ? hoursUntil(rw.resets) : null;
+  const renewSoon = h == null ? 0 : 100 * Math.max(0, Math.min(1, 1 - h / RENEW_HORIZON_H));
+  return headroom + renewSoon;           // safe to use + about to reset = use it first
+}
 
 function recommend(rows) {
   const ex = excludedSet();
@@ -456,25 +477,28 @@ function recommend(rows) {
     if (ex.has(accountKey(r))) return false;
     if (rowState(r).kind !== "fresh") return false;
     const bw = bindingWindow(r);
+    // >= MIN_LEFT% headroom on the tightest window: no window near its limit.
     return bw && (100 - bw.pct) >= MIN_LEFT;
   });
   if (!usable.length) return null;
   usable.sort((a, b) => {
-    const ba = bindingWindow(a), bb = bindingWindow(b);
-    if (bb.pct !== ba.pct) return bb.pct - ba.pct;                 // nearest its limit first
-    const ra = hoursUntil(ba.resets), rb = hoursUntil(bb.resets);
-    if (ra != null && rb != null && ra !== rb) return ra - rb;     // then sooner reset
+    const d = useScore(b) - useScore(a);
+    if (d) return d;
     return String(a.label).localeCompare(String(b.label));
   });
-  const best = usable[0], bw = bindingWindow(best);
-  return { row: best, pct: Math.round(bw.pct), left: Math.round(100 - bw.pct), bw: bw };
+  const best = usable[0], bw = bindingWindow(best), rw = renewWindow(best);
+  return { row: best, pct: Math.round(bw.pct), left: Math.round(100 - bw.pct), bw: bw, rw: rw };
 }
 
 function pickChip(pick) {
   if (!pick) return "";
-  const bw = pick.bw;
-  const title = bw ? bw.label + " " + pick.pct + "% used \u00b7 " + pick.left + "% left \u00b7 resets " + when(bw.resets, bw.inferred) : "";
-  return '<span title="' + title + '">Use first \u2192 <b>' + pick.row.label + "</b> \u00b7 " + pick.left + "% left</span>";
+  const rw = pick.rw;
+  const h = rw ? hoursUntil(rw.resets) : null;
+  const renew = h == null ? ""
+    : h < 48 ? " \u00b7 renews in " + Math.max(0, Math.round(h)) + "h"
+             : " \u00b7 renews in " + Math.round(h / 24) + "d";
+  const title = pick.bw ? pick.bw.label + " " + pick.pct + "% used \u00b7 " + pick.left + "% left" + (rw ? " \u00b7 weekly resets " + when(rw.resets, rw.inferred) : "") : "";
+  return '<span title="' + title + '">Use first \u2192 <b>' + pick.row.label + "</b> \u00b7 " + pick.left + "% left" + renew + "</span>";
 }
 
 function incBox(r) {

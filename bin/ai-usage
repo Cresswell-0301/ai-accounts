@@ -219,6 +219,14 @@ overflow:hidden;min-width:74px}
 .empty{color:var(--mut);text-align:center;padding:26px 0}
 td.badge-dead{display:inline-block;margin-left:8px;padding:1px 7px;border-radius:10px;background:#7f1d1d;color:#fecaca;font-size:11px;font-weight:600;vertical-align:middle}
 .badge-stale{display:inline-block;margin-left:8px;padding:1px 7px;border-radius:10px;background:#78350f;color:#fde68a;font-size:11px;font-weight:600;vertical-align:middle}
+.badge-rl{display:inline-block;margin-left:8px;padding:1px 7px;border-radius:10px;background:#1e3a5f;color:#bfdbfe;font-size:11px;font-weight:600;vertical-align:middle}
+.pick{margin-left:12px;font-size:12px;color:#86efac;font-weight:600;white-space:nowrap}
+.pick b{color:#bbf7d0}
+.badge-pick{display:inline-block;margin-left:8px;padding:1px 8px;border-radius:10px;background:#14532d;color:#bbf7d0;font-size:11px;font-weight:700;vertical-align:middle}
+tr.rowpick td{background:rgba(34,197,94,.07)}
+.actcell{text-align:right;white-space:nowrap}
+.actbtns{display:inline-flex;align-items:center;gap:6px}
+.inc{margin:0;width:14px;height:14px;cursor:pointer;accent-color:#22c55e}
 .rowstale td:not(.acct){opacity:.45}
 .msg{text-align:center;color:var(--mut)}
 .note{color:var(--mut);font-size:12px;margin-top:14px}
@@ -276,7 +284,7 @@ color:var(--mut);font-weight:600;margin-bottom:5px}
 
 <div class="card">
 <div class="cardhead">
-<div class="titlegrp"><h2>Claude Code</h2><span class="synctime" id="ccsync"></span></div>
+<div class="titlegrp"><h2>Claude Code</h2><span class="synctime" id="ccsync"></span><span class="pick" id="ccpick"></span></div>
 <div class="headbtns">
 <button class="icon" data-sync="claude" title="Sync Claude Code" aria-label="Sync Claude Code"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 1-15.5 6.2L3 16"/><path d="M3 21v-5h5"/><path d="M3 12a9 9 0 0 1 15.5-6.2L21 8"/><path d="M21 3v5h-5"/></svg></button>
 <button class="small" data-add="claude" title="Add a Claude Code account">+</button>
@@ -290,7 +298,7 @@ color:var(--mut);font-weight:600;margin-bottom:5px}
 
 <div class="card">
 <div class="cardhead">
-<div class="titlegrp"><h2>Codex</h2><span class="synctime" id="cxsync"></span></div>
+<div class="titlegrp"><h2>Codex</h2><span class="synctime" id="cxsync"></span><span class="pick" id="cxpick"></span></div>
 <div class="headbtns">
 <button class="icon" data-sync="codex" title="Sync Codex" aria-label="Sync Codex"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 1-15.5 6.2L3 16"/><path d="M3 21v-5h5"/><path d="M3 12a9 9 0 0 1 15.5-6.2L21 8"/><path d="M21 3v5h-5"/></svg></button>
 <button class="small" data-add="codex" title="Add a Codex account">+</button>
@@ -340,13 +348,53 @@ function cell(w) {
     <div class="meter"><i style="width:${Math.max(w.pct,2)}%;background:${colour(w)}"></i></div></td>`;
 }
 
+// One classifier for a row's freshness, shared by the per-row badge and the
+// section clock so the two can never disagree. Kinds: dead (credential spent,
+// only re-login recovers it), ratelimited (the usage poll is 429'd, often the
+// account is at its weekly/session cap - the shown numbers are real but frozen
+// until the limit clears, NOT a fault), stale (older than the poll window for no
+// known reason), fresh, nodata.
+function rowState(r) {
+  const L = r.limits || {};
+  const err = String(L.error || "");
+  if (err.indexOf("re-login") >= 0 || err.indexOf("invalid_grant") >= 0 || err.indexOf("not signed in") >= 0)
+    return { kind: "dead", mins: null };
+  const a = L.as_of;
+  const mins = a ? (Date.now() / 1000 - a) / 60 : null;
+  if (err.indexOf("Rate Limit") >= 0) return { kind: "ratelimited", mins };
+  if (mins == null) return { kind: "nodata", mins: null };
+  const codex = r.tool === "codex";
+  const freshUntil = codex ? 75 : 15;      // hourly + margin vs the 2-min claude poll
+  const deadAfter = codex ? 1440 : 180;    // no error and this old => a token that died silently
+  if (mins < freshUntil) return { kind: "fresh", mins };
+  if (mins >= deadAfter) return { kind: "dead", mins };
+  return { kind: "stale", mins };
+}
+
 function sectionSync(rows) {
   // The OLDEST reading in the section: every row in it is at least this fresh.
   // Showing the newest would hide one account that has quietly gone stale.
-  const ts = rows.filter(r => r.limits && (r.limits.windows || []).length && r.limits.as_of)
-                 .map(r => r.limits.as_of);
-  if (!ts.length) return "";
-  const t = Math.min.apply(null, ts);
+  // A DEAD account (needs re-login) is excluded — it already carries its own
+  // loud "re-sign in needed" badge, so letting its frozen timestamp drag the
+  // whole section's clock to "9h ago" would just double-report the same fault
+  // and hide how fresh the live accounts actually are.
+  // An account behind for a KNOWN reason (dead / rate-limited / at cap) carries
+  // its own row badge; its frozen timestamp must not drag the section clock, or
+  // one capped account makes the header read "1d ago" while 6 accounts are live.
+  // Exclude the behind ones, COUNT them, and show the oldest of the rest so a
+  // genuinely drifting account still surfaces. All behind => newest success.
+  const withData = rows.filter(r => r.limits && (r.limits.windows || []).length && r.limits.as_of);
+  if (!withData.length) return "";
+  const isBehind = (r) => {
+    const k = rowState(r).kind;
+    return k === "dead" || k === "ratelimited" || k === "stale";
+  };
+  const behind = withData.filter(isBehind);
+  const current = withData.filter(r => behind.indexOf(r) < 0);
+  const pool = current.length ? current : withData;
+  const t = current.length
+    ? Math.min.apply(null, pool.map(r => r.limits.as_of))
+    : Math.max.apply(null, pool.map(r => r.limits.as_of));
   const d = new Date(t * 1000);
   const mins = Math.max(0, Math.floor((Date.now() - t * 1000) / 60000));
   const rel = mins < 1 ? "just now" : mins < 60 ? mins + "m ago"
@@ -354,7 +402,86 @@ function sectionSync(rows) {
   const clock = mins < 1440
     ? d.toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"})
     : d.toLocaleDateString([], {weekday: "short", day: "numeric", month: "short"});
-  return "Synced " + clock + " \u00b7 " + rel;
+  const suffix = behind.length ? " \u00b7 " + behind.length + " behind" : "";
+  return "Synced " + clock + " \u00b7 " + rel + suffix;
+}
+
+// \u2500\u2500 "Use first" suggestion \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+// Which account to reach for right now, and a per-account opt-out for the ones
+// you only MONITOR (e.g. a shared account another team actually uses).
+
+const SUGGEST_EXCLUDE_KEY = "ai-usage:suggest-exclude";
+// Stable per-account id: email if we have it (survives a re-login that keeps the
+// same slot), else the label. Namespaced by tool so a claude/codex pair can't clash.
+function accountKey(r) { return r.tool + ":" + (r.email || r.label); }
+function excludedSet() {
+  try { return new Set(JSON.parse(localStorage.getItem(SUGGEST_EXCLUDE_KEY) || "[]")); }
+  catch (e) { return new Set(); }
+}
+function setExcluded(key, excluded) {
+  try {
+    const s = excludedSet();
+    if (excluded) s.add(key); else s.delete(key);
+    localStorage.setItem(SUGGEST_EXCLUDE_KEY, JSON.stringify(Array.from(s)));
+  } catch (e) {}
+}
+
+// The window closest to its limit is what walls you off first \u2014 session resets
+// fast, but a high session% still stops you TODAY \u2014 so the binding window is the
+// one with the highest used %, whichever kind it is.
+function bindingWindow(r) {
+  let best = null;
+  for (const w of ((r.limits && r.limits.windows) || [])) {
+    if (typeof w.pct !== "number") continue;
+    if (!best || w.pct > best.pct) best = w;
+  }
+  return best;
+}
+function hoursUntil(epoch) { return epoch ? (epoch * 1000 - Date.now()) / 3600000 : null; }
+
+// The rule: suggest the account NEAREST its limit first \u2014 finish off the most-used
+// one before touching the fresh ones, so accounts fill up one at a time instead of
+// all sitting half-used \u2014 but NEVER suggest one with less than MIN_LEFT% remaining,
+// which is too close to the wall to be worth starting. Renew time breaks ties: of
+// two equally-used accounts, prefer the one resetting sooner (spend the budget that
+// would otherwise reset away first).
+//
+// Eligible = FRESH & measured (a dead/rate-limited/stale reading is not a number to
+// steer by), not opted out via its checkbox, and with >= MIN_LEFT% left.
+const MIN_LEFT = 10;
+
+function recommend(rows) {
+  const ex = excludedSet();
+  const usable = rows.filter(r => {
+    if (ex.has(accountKey(r))) return false;
+    if (rowState(r).kind !== "fresh") return false;
+    const bw = bindingWindow(r);
+    return bw && (100 - bw.pct) >= MIN_LEFT;
+  });
+  if (!usable.length) return null;
+  usable.sort((a, b) => {
+    const ba = bindingWindow(a), bb = bindingWindow(b);
+    if (bb.pct !== ba.pct) return bb.pct - ba.pct;                 // nearest its limit first
+    const ra = hoursUntil(ba.resets), rb = hoursUntil(bb.resets);
+    if (ra != null && rb != null && ra !== rb) return ra - rb;     // then sooner reset
+    return String(a.label).localeCompare(String(b.label));
+  });
+  const best = usable[0], bw = bindingWindow(best);
+  return { row: best, pct: Math.round(bw.pct), left: Math.round(100 - bw.pct), bw: bw };
+}
+
+function pickChip(pick) {
+  if (!pick) return "";
+  const bw = pick.bw;
+  const title = bw ? bw.label + " " + pick.pct + "% used \u00b7 " + pick.left + "% left \u00b7 resets " + when(bw.resets, bw.inferred) : "";
+  return '<span title="' + title + '">Use first \u2192 <b>' + pick.row.label + "</b> \u00b7 " + pick.left + "% left</span>";
+}
+
+function incBox(r) {
+  const k = accountKey(r);
+  const on = !excludedSet().has(k);
+  return '<input type="checkbox" class="inc" data-key="' + k + '"' + (on ? " checked" : "") +
+    ' title="Include this account in the ' + "\u2018" + "use first" + "\u2019" + ' suggestion" aria-label="Include ' + r.label + ' in suggestion">';
 }
 
 function relDays(ts) {
@@ -380,12 +507,7 @@ function rtime(w, kind) {
 
 function actions(r) {
   const signed = !!r.email;
-  return `<td style="text-align:right;white-space:nowrap">
-    <button class="icon" data-tool="${r.tool}" data-name="${r.label}"
-      title="${signed ? "Re-sign in" : "Sign in"} ${r.label}"
-      aria-label="${signed ? "Re-sign in" : "Sign in"} ${r.label}">${SIGNIN}</button>
-    <button class="icon danger" title="Remove ${r.label}" aria-label="Remove ${r.label}"
-      data-del-tool="${r.tool}" data-del-name="${r.label}">${TRASH}</button>
+  return `<td class="actcell"><span class="actbtns"><button class="icon" data-tool="${r.tool}" data-name="${r.label}" title="${signed ? "Re-sign in" : "Sign in"} ${r.label}" aria-label="${signed ? "Re-sign in" : "Sign in"} ${r.label}">${SIGNIN}</button><button class="icon danger" title="Remove ${r.label}" aria-label="Remove ${r.label}" data-del-tool="${r.tool}" data-del-name="${r.label}">${TRASH}</button>${incBox(r)}</span>
     <div class="authlink" id="lk-${r.tool}-${r.label}"></div></td>`;
 }
 
@@ -405,24 +527,27 @@ function render() {
   $("sub").innerHTML = META.live ? '<span class="dot"></span>Live' : "generated " + META.generated;
 
   const staleTag = (r) => {
-    // Age is ground truth (r.limits.live is unreliable). Thresholds depend on
-    // how often that tool is polled: Claude every ~2min, Codex only hourly by
-    // design, so 18min old is FRESH for Codex but stale for Claude.
-    const L = r.limits || {};
-    const a = L.as_of;
-    if (!a) return "";
-    const mins = (Date.now()/1000 - a) / 60;
-    const codex = r.tool === "codex";
-    const freshUntil = codex ? 75 : 15;      // hourly + margin vs 2min poll
-    const deadAfter  = codex ? 1440 : 180;   // Codex: only flag after a full day
-    if (mins < freshUntil) return "";
-    if (mins >= deadAfter)
-      return '<span class="badge-dead">re-sign in needed</span>';
-    const h = mins/60;
-    return '<span class="badge-stale">stale \u00b7 ' +
-      (h >= 1 ? Math.round(h) + "h" : Math.round(mins) + "m") + ' old</span>';
+    // rowState classifies once; the badge names WHY a row is behind (dead vs
+    // rate-limited vs plain stale) instead of lumping them all as "re-sign in".
+    const s = rowState(r);
+    if (s.kind === "dead") return '<span class="badge-dead">re-sign in needed</span>';
+    if (s.kind === "ratelimited") return '<span class="badge-rl">rate limited</span>';
+    if (s.kind === "stale") {
+      const h = s.mins / 60;
+      return '<span class="badge-stale">stale \u00b7 ' +
+        (h >= 1 ? Math.round(h) + "h" : Math.round(s.mins) + "m") + ' old</span>';
+    }
+    return "";
+  };
+  // Dim a row only when its data is genuinely behind (dead or stale). A
+  // rate-limited row shows real numbers you often MOST want to read (an account
+  // sitting at its cap), so it keeps full opacity beside its "rate limited" badge.
+  const dimRow = (r) => {
+    const k = rowState(r).kind;
+    return k === "dead" || k === "stale";
   };
   const cc = DATA.filter(r => r.tool === "claude");
+  const ccPick = recommend(cc);
   $("cc").innerHTML = cc.length ? cc.map(r => {
     const wins = (r.limits && r.limits.windows) || [];
     if (!wins.length) {
@@ -433,18 +558,25 @@ function render() {
     const sess = find(wins, "session"), week = find(wins, "weekly_all"),
           fab = wins.find(w => w.kind === "weekly_scoped");
     const st = staleTag(r);
-    return `<tr class="${st ? "rowstale" : ""}"><td class="acct">${r.label}<small>${r.email || ""}${st}</small></td>
+    const isPick = ccPick && r === ccPick.row;
+    const pick = isPick ? '<span class="badge-pick">use first</span>' : "";
+    return `<tr class="${dimRow(r) ? "rowstale" : ""}${isPick ? " rowpick" : ""}"><td class="acct">${r.label}${pick}<small>${r.email || ""}${st}</small></td>
       ${cell(sess)}<td class="renew">${rtime(sess, "session")}</td>
       ${cell(week)}<td class="renew">${rtime(week, "weekly")}</td>
       ${cell(fab)}${actions(r)}</tr>`;
   }).join("") : '<tr><td colspan="6" class="empty">No Claude accounts configured.</td></tr>';
 
   $("ccsync").textContent = sectionSync(cc);
+  $("ccpick").innerHTML = pickChip(ccPick);
   const cx = DATA.filter(r => r.tool === "codex");
+  const cxPick = recommend(cx);
   $("cxsync").textContent = sectionSync(cx);
+  $("cxpick").innerHTML = pickChip(cxPick);
   $("cx").innerHTML = cx.length ? cx.map(r => {
     const wins = (r.limits && r.limits.windows) || [];
     const plan = r.plan || (r.limits && r.limits.plan) || "";
+    const isPick = cxPick && r === cxPick.row;
+    const pick = isPick ? '<span class="badge-pick">use first</span>' : "";
     const head = `<td class="acct">${r.label}<small>${r.email || ""}${plan ? " \u00b7 " + plan : ""}</small></td>`;
     if (!wins.length) {
       const why = (r.limits && r.limits.error) || r.skipped || "no data";
@@ -456,8 +588,8 @@ function render() {
           x.label + " " + Math.round(x.pct) + "%").join(" \u00b7 ") + "</div>"
       : "";
     const st = staleTag(r);
-    const head2 = `<td class="acct">${r.label}<small>${r.email || ""}${plan ? " \u00b7 " + plan : ""}${st}</small></td>`;
-    return `<tr class="${st ? "rowstale" : ""}">${head2}${cell(w)}
+    const head2 = `<td class="acct">${r.label}${pick}<small>${r.email || ""}${plan ? " \u00b7 " + plan : ""}${st}</small></td>`;
+    return `<tr class="${dimRow(r) ? "rowstale" : ""}${isPick ? " rowpick" : ""}">${head2}${cell(w)}
       <td class="renew"><b>${when(w.resets, w.inferred)}</b>${relDays(w.resets)}${extra}</td>
       ${actions(r)}</tr>`;
   }).join("") : '<tr><td colspan="4" class="empty">No Codex accounts configured.</td></tr>';
@@ -472,6 +604,12 @@ function wireRows() {
   });
   document.querySelectorAll("button[data-del-tool]").forEach(b => {
     b.onclick = () => removeAccount(b.dataset.delTool, b.dataset.delName, b);
+  });
+  // Toggle an account in/out of the "use first" suggestion (monitor-only accounts
+  // stay on the board but are never recommended). Persists per browser; re-render
+  // so the pick moves immediately.
+  document.querySelectorAll("input.inc").forEach(b => {
+    b.onchange = () => { setExcluded(b.dataset.key, !b.checked); render(); };
   });
 }
 
@@ -785,6 +923,12 @@ def refresh_token(config_dir, blob):
         with urllib.request.urlopen(req, timeout=30) as r:
             doc = json.loads(r.read().decode())
     except urllib.error.HTTPError as e:
+        # 400 = invalid_grant: the refresh token was consumed or expired past
+        # its 28-day window. No amount of retrying recovers it — only a browser
+        # re-login does — so say "re-login" rather than a bare "HTTP 400" that
+        # reads like a transient blip and invites a retry loop.
+        if e.code == 400:
+            return None, "invalid_grant — re-login"
         return None, "HTTP %d" % e.code
     except Exception as e:
         return None, str(e)[:50]
@@ -812,6 +956,14 @@ import threading as _threading
 _refresh_locks = {}
 _refresh_locks_guard = _threading.Lock()
 
+# A refresh token that returned invalid_grant is dead until a browser re-login,
+# yet the poll loop revisits every ~10s. Without this, a single dead account
+# POSTs the token endpoint 6x/min forever. Remember the verdict and skip the
+# call until the backoff clears; a re-login writes a fresh, unexpired access
+# token, so token_for early-returns before it ever consults this again.
+_dead_refresh = {}          # config_dir -> epoch until which refresh is skipped
+DEAD_REFRESH_BACKOFF = 900  # 15 min
+
 
 def _refresh_lock(config_dir):
     with _refresh_locks_guard:
@@ -836,6 +988,13 @@ def token_for(config_dir):
     if exp and exp - time.time() > REFRESH_MARGIN:
         return blob, None
 
+    # The access token is expired (or absent) and there is no refresh token to
+    # trade for a new one — the credential is spent. Return a canonical
+    # "re-login" so every consumer (badge, section clock, poll skip) treats it
+    # as dead, instead of a bare "no token" that slips past those checks.
+    if not blob.get("refreshToken"):
+        return blob, "credential empty — re-login"
+
     with _refresh_lock(config_dir):
         # Re-read inside the lock: another thread may have just refreshed.
         blob = keychain_token(config_dir) or blob
@@ -843,9 +1002,16 @@ def token_for(config_dir):
         if exp and exp - time.time() > REFRESH_MARGIN:
             return blob, None
 
+        # Don't re-POST a refresh known to be dead until the backoff clears.
+        if _dead_refresh.get(config_dir, 0) > time.time():
+            return blob, "refresh failed: invalid_grant — re-login"
+
         fresh, err = refresh_token(config_dir, blob)
         if not fresh:
+            if "invalid_grant" in str(err):
+                _dead_refresh[config_dir] = time.time() + DEAD_REFRESH_BACKOFF
             return blob, "refresh failed: %s" % err
+        _dead_refresh.pop(config_dir, None)
 
         # The old token is now consumed; persist the new one or it is lost.
         for _ in range(3):
@@ -884,11 +1050,15 @@ def keychain_token(config_dir=None):
 
 
 def live_claude_usage(blob):
-    """Returns (windows, error). Never raises."""
+    """Returns (windows, error, retry_after). Never raises.
+
+    retry_after is the server's Retry-After (seconds) on a 429, so the caller
+    can wait exactly as long as told instead of a fixed guess that may be
+    SHORTER than the window and re-poke a rate-limited account forever."""
     import urllib.request, urllib.error
     tok = (blob or {}).get("accessToken")
     if not tok:
-        return None, "no token"
+        return None, "no token", None
     req = urllib.request.Request(USAGE_URL, headers={
         "Authorization": "Bearer " + tok,
         "anthropic-beta": "oauth-2025-04-20",
@@ -899,12 +1069,17 @@ def live_claude_usage(blob):
             doc = json.loads(r.read().decode())
     except urllib.error.HTTPError as e:
         if e.code in (401, 403):
-            return None, "token expired \u2014 re-login"
+            return None, "token expired \u2014 re-login", None
         if e.code == 429:
-            return None, "Rate Limit"
-        return None, "HTTP %d" % e.code
+            ra = None
+            try:
+                ra = int(float(e.headers.get("retry-after")))
+            except (TypeError, ValueError):
+                ra = None
+            return None, "Rate Limit", ra
+        return None, "HTTP %d" % e.code, None
     except Exception as e:
-        return None, str(e)[:40]
+        return None, str(e)[:40], None
 
     u = doc.get("utilization") or doc
     wins = []
@@ -927,7 +1102,7 @@ def live_claude_usage(blob):
                      "resets": _iso_epoch(e.get("resets_at")),
                      "severity": e.get("severity"),
                      "active": bool(e.get("is_active")), "live": True})
-    return (wins or None), None
+    return (wins or None), None, None
 
 
 PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
@@ -981,7 +1156,7 @@ def cached_usage(d, blob):
     if ent and now < ent.get("next_ok", 0):
         return ent["windows"], ent["at"], ent.get("stale_reason")
 
-    wins, err = live_claude_usage(blob)
+    wins, err, retry = live_claude_usage(blob)
     if wins:
         _usage_cache[d] = {"windows": wins, "at": now,
                            "next_ok": now + MIN_POLL_SECONDS, "stale_reason": None}
@@ -989,7 +1164,17 @@ def cached_usage(d, blob):
         return wins, now, None
 
     reason = err or "fetch failed"
-    wait = BACKOFF_SECONDS if "Rate Limit" in str(err) else MIN_POLL_SECONDS
+    if "Rate Limit" in str(err):
+        # Wait exactly as long as the server said (Retry-After), never less: a
+        # fixed 5-min guess shorter than the window re-pokes the account before
+        # it clears, keeps drawing 429s, and drags the section clock for hours.
+        # Cap at 1h so a bogus header can't freeze a row for a day.
+        wait = min(retry, 3600) if retry and retry > 0 else BACKOFF_SECONDS
+    elif "re-login" in str(err):
+        # Expired/dead token: no point polling until the user re-signs in.
+        wait = 900
+    else:
+        wait = MIN_POLL_SECONDS
     if ent and ent.get("windows"):
         ent["next_ok"] = now + wait
         ent["stale_reason"] = reason
@@ -1288,6 +1473,30 @@ def codex_plan(d):
 def limits_for(tool, d):
     if tool == "claude":
         blob, tok_err = token_for(d)
+        # A dead or absent credential must NOT fall through to usage polling.
+        # With an expired access token the usage API answers 429, which the
+        # backoff mistakes for ordinary rate-limiting and re-pokes forever —
+        # that is exactly how one dead account (looiytube3) dragged the whole
+        # section's clock to 9h. Serve the last good reading, if any, and label
+        # it honestly so the row says "re-sign in", not "Rate Limit".
+        # (A successful-but-unpersisted refresh keeps blob and is NOT caught
+        # here: its message is "…Keychain write failed", which has no re-login.)
+        if tok_err and ("re-login" in tok_err or "invalid_grant" in tok_err
+                        or "not signed in" in tok_err):
+            ent = _usage_cache.get(d)
+            if ent and ent.get("windows"):
+                return {"windows": ent["windows"], "as_of": ent.get("at"),
+                        "live": False, "error": tok_err,
+                        "plan": (blob or {}).get("subscriptionType"),
+                        "credits": None, "account": None}
+            cached = claude_limits(d)
+            if cached:
+                cached["error"] = tok_err
+                cached["live"] = False
+                return infer_reset(cached, tool, d)
+            return {"windows": [], "as_of": None, "live": False,
+                    "error": tok_err, "plan": None,
+                    "credits": None, "account": None}
         if blob:
             wins, at, reason = cached_usage(d, blob)
             if wins:

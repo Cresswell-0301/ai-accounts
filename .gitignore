@@ -16,3 +16,7 @@ token.json
 # Local backups of the script
 bin/*.bak.*
 bin/*.today-ui.*
+
+# python bytecode
+__pycache__/
+*.pyc

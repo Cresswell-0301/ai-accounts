@@ -226,7 +226,7 @@ td.badge-dead{display:inline-block;margin-left:8px;padding:1px 7px;border-radius
 tr.rowpick td{background:rgba(34,197,94,.07)}
 .actcell{text-align:right;white-space:nowrap}
 .actbtns{display:inline-flex;align-items:center;gap:6px}
-.inc{margin:0;width:14px;height:14px;cursor:pointer;accent-color:#22c55e}
+.inc{margin:0;width:14px;height:14px;min-width:14px;flex:0 0 auto;cursor:pointer;accent-color:#22c55e}
 .rowstale td:not(.acct){opacity:.45}
 .msg{text-align:center;color:var(--mut)}
 .note{color:var(--mut);font-size:12px;margin-top:14px}

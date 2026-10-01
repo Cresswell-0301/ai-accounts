@@ -220,10 +220,15 @@ overflow:hidden;min-width:74px}
 td.badge-dead{display:inline-block;margin-left:8px;padding:1px 7px;border-radius:10px;background:#7f1d1d;color:#fecaca;font-size:11px;font-weight:600;vertical-align:middle}
 .badge-stale{display:inline-block;margin-left:8px;padding:1px 7px;border-radius:10px;background:#78350f;color:#fde68a;font-size:11px;font-weight:600;vertical-align:middle}
 .badge-rl{display:inline-block;margin-left:8px;padding:1px 7px;border-radius:10px;background:#1e3a5f;color:#bfdbfe;font-size:11px;font-weight:600;vertical-align:middle}
-.pick{margin-left:12px;font-size:12px;color:#86efac;font-weight:600;white-space:nowrap}
-.pick b{color:#bbf7d0}
+.pick{margin-left:12px;font-size:12px;font-weight:600;white-space:nowrap}
+.pick-safe{color:#86efac}
+.pick-safe b{color:#bbf7d0}
+.pick-free{color:#fbbf24}
+.pick-free b{color:#fde68a}
 .badge-pick{display:inline-block;margin-left:8px;padding:1px 8px;border-radius:10px;background:#14532d;color:#bbf7d0;font-size:11px;font-weight:700;vertical-align:middle}
+.badge-free{display:inline-block;margin-left:8px;padding:1px 8px;border-radius:10px;background:#78350f;color:#fde68a;font-size:11px;font-weight:700;vertical-align:middle}
 tr.rowpick td{background:rgba(34,197,94,.07)}
+tr.rowfree td{background:rgba(251,191,36,.07)}
 .actcell{text-align:right;white-space:nowrap}
 .actbtns{display:inline-flex;align-items:center;gap:6px}
 .inc{margin:0;width:14px;height:14px;min-width:14px;flex:0 0 auto;cursor:pointer;accent-color:#22c55e}
@@ -458,42 +463,70 @@ function renewWindow(r) {
   return wins.find(w => w.kind === "weekly_all") || bindingWindow(r);
 }
 
+const kindLabel = (k) => (k === "session" ? "session" : k === "weekly_scoped" ? "weekly Fable" : "weekly");
+
+// When every account is near a limit, the one that FREES UP soonest is whichever
+// has the nearest "all its over-limit windows have reset" moment \u2014 i.e. the LATEST
+// reset among its own over-limit windows (it is usable only once the last one
+// clears). Returns that time + the window that gates it.
+function freesUpHours(r) {
+  let worst = null, win = null;
+  for (const w of ((r.limits && r.limits.windows) || [])) {
+    if (typeof w.pct !== "number" || (100 - w.pct) >= MIN_LEFT) continue;  // only over-limit windows
+    const h = hoursUntil(w.resets), hv = (h == null ? Infinity : h);
+    if (worst == null || hv > worst) { worst = hv; win = w; }
+  }
+  return { hours: worst, window: win };
+}
+
 function recommend(rows) {
   const ex = excludedSet();
-  const usable = rows.filter(r => {
-    if (ex.has(accountKey(r))) return false;
-    if (rowState(r).kind !== "fresh") return false;
-    const bw = bindingWindow(r);
-    // >= MIN_LEFT% headroom on the tightest window: no window near its limit.
-    return bw && (100 - bw.pct) >= MIN_LEFT;
-  });
-  if (!usable.length) return null;
-  usable.sort((a, b) => {
-    // 1) soonest weekly renew first \u2014 use it before it resets and is wasted.
-    //    An unknown reset time (no weekly window / no date) has no deadline, so it
-    //    sorts last.
-    const ha = hoursUntil(renewWindow(a) && renewWindow(a).resets);
-    const hb = hoursUntil(renewWindow(b) && renewWindow(b).resets);
-    const ra = ha == null ? Infinity : ha, rb = hb == null ? Infinity : hb;
+  const fresh = rows.filter(r => !ex.has(accountKey(r)) && rowState(r).kind === "fresh" && bindingWindow(r));
+  const safe = fresh.filter(r => (100 - bindingWindow(r).pct) >= MIN_LEFT);
+  if (safe.length) {
+    safe.sort((a, b) => {
+      // soonest weekly renew first (use it before it resets); tie -> more headroom.
+      const ha = hoursUntil(renewWindow(a) && renewWindow(a).resets);
+      const hb = hoursUntil(renewWindow(b) && renewWindow(b).resets);
+      const ra = ha == null ? Infinity : ha, rb = hb == null ? Infinity : hb;
+      if (ra !== rb) return ra - rb;
+      const ua = bindingWindow(a).pct, ub = bindingWindow(b).pct;
+      if (ua !== ub) return ua - ub;
+      return String(a.label).localeCompare(String(b.label));
+    });
+    const best = safe[0], bw = bindingWindow(best), rw = renewWindow(best);
+    return { row: best, mode: "safe", pct: Math.round(bw.pct), left: Math.round(100 - bw.pct), bw: bw, rw: rw };
+  }
+  // Nothing safe: every account is within MIN_LEFT% of a limit. Still point
+  // somewhere \u2014 the account that frees up soonest, so you know which to wait for.
+  if (!fresh.length) return null;
+  fresh.sort((a, b) => {
+    const fa = freesUpHours(a).hours, fb = freesUpHours(b).hours;
+    const ra = fa == null ? Infinity : fa, rb = fb == null ? Infinity : fb;
     if (ra !== rb) return ra - rb;
-    // 2) tie: more headroom first (lower usage on the tightest window).
-    const ua = bindingWindow(a).pct, ub = bindingWindow(b).pct;
-    if (ua !== ub) return ua - ub;
     return String(a.label).localeCompare(String(b.label));
   });
-  const best = usable[0], bw = bindingWindow(best), rw = renewWindow(best);
-  return { row: best, pct: Math.round(bw.pct), left: Math.round(100 - bw.pct), bw: bw, rw: rw };
+  const best = fresh[0], bw = bindingWindow(best);
+  return { row: best, mode: "fallback", pct: Math.round(bw.pct), left: Math.round(100 - bw.pct), bw: bw, free: freesUpHours(best) };
 }
 
 function pickChip(pick) {
   if (!pick) return "";
+  if (pick.mode === "fallback") {
+    const fu = pick.free || {}, h = fu.hours;
+    const freeIn = (h == null || h === Infinity) ? "later"
+      : h < 48 ? "in " + Math.max(0, Math.round(h)) + "h" : "in " + Math.round(h / 24) + "d";
+    const title = "every account is within " + MIN_LEFT + "% of a limit"
+      + (fu.window ? " \u00b7 " + kindLabel(fu.window.kind) + " resets " + when(fu.window.resets, fu.window.inferred) : "");
+    return '<span class="pick-free" title="' + title + '">All near limit \u2014 <b>' + pick.row.label + "</b> frees up " + freeIn + "</span>";
+  }
   const rw = pick.rw;
   const h = rw ? hoursUntil(rw.resets) : null;
   const renew = h == null ? ""
     : h < 48 ? " \u00b7 renews in " + Math.max(0, Math.round(h)) + "h"
              : " \u00b7 renews in " + Math.round(h / 24) + "d";
   const title = pick.bw ? pick.bw.label + " " + pick.pct + "% used \u00b7 " + pick.left + "% left" + (rw ? " \u00b7 weekly resets " + when(rw.resets, rw.inferred) : "") : "";
-  return '<span title="' + title + '">Use first \u2192 <b>' + pick.row.label + "</b> \u00b7 " + pick.left + "% left" + renew + "</span>";
+  return '<span class="pick-safe" title="' + title + '">Use first \u2192 <b>' + pick.row.label + "</b> \u00b7 " + pick.left + "% left" + renew + "</span>";
 }
 
 function incBox(r) {
@@ -577,9 +610,9 @@ function render() {
     const sess = find(wins, "session"), week = find(wins, "weekly_all"),
           fab = wins.find(w => w.kind === "weekly_scoped");
     const st = staleTag(r);
-    const isPick = ccPick && r === ccPick.row;
-    const pick = isPick ? '<span class="badge-pick">use first</span>' : "";
-    return `<tr class="${dimRow(r) ? "rowstale" : ""}${isPick ? " rowpick" : ""}"><td class="acct">${r.label}${pick}<small>${r.email || ""}${st}</small></td>
+    const isPick = ccPick && r === ccPick.row, fb = isPick && ccPick.mode === "fallback";
+    const pick = isPick ? (fb ? '<span class="badge-free">frees up next</span>' : '<span class="badge-pick">use first</span>') : "";
+    return `<tr class="${dimRow(r) ? "rowstale" : ""}${isPick ? (fb ? " rowfree" : " rowpick") : ""}"><td class="acct">${r.label}${pick}<small>${r.email || ""}${st}</small></td>
       ${cell(sess)}<td class="renew">${rtime(sess, "session")}</td>
       ${cell(week)}<td class="renew">${rtime(week, "weekly")}</td>
       ${cell(fab)}${actions(r)}</tr>`;
@@ -594,8 +627,8 @@ function render() {
   $("cx").innerHTML = cx.length ? cx.map(r => {
     const wins = (r.limits && r.limits.windows) || [];
     const plan = r.plan || (r.limits && r.limits.plan) || "";
-    const isPick = cxPick && r === cxPick.row;
-    const pick = isPick ? '<span class="badge-pick">use first</span>' : "";
+    const isPick = cxPick && r === cxPick.row, fb = isPick && cxPick.mode === "fallback";
+    const pick = isPick ? (fb ? '<span class="badge-free">frees up next</span>' : '<span class="badge-pick">use first</span>') : "";
     const head = `<td class="acct">${r.label}<small>${r.email || ""}${plan ? " \u00b7 " + plan : ""}</small></td>`;
     if (!wins.length) {
       const why = (r.limits && r.limits.error) || r.skipped || "no data";
@@ -608,7 +641,7 @@ function render() {
       : "";
     const st = staleTag(r);
     const head2 = `<td class="acct">${r.label}${pick}<small>${r.email || ""}${plan ? " \u00b7 " + plan : ""}${st}</small></td>`;
-    return `<tr class="${dimRow(r) ? "rowstale" : ""}${isPick ? " rowpick" : ""}">${head2}${cell(w)}
+    return `<tr class="${dimRow(r) ? "rowstale" : ""}${isPick ? (fb ? " rowfree" : " rowpick") : ""}">${head2}${cell(w)}
       <td class="renew"><b>${when(w.resets, w.inferred)}</b>${relDays(w.resets)}${extra}</td>
       ${actions(r)}</tr>`;
   }).join("") : '<tr><td colspan="4" class="empty">No Codex accounts configured.</td></tr>';
@@ -2025,31 +2058,41 @@ def _hours_until(w):
     return (r - time.time()) / 3600 if r else None
 
 
+def _frees_up_hours(row):
+    """When an account next has headroom on ALL windows: the latest reset among the
+    windows it is currently over the limit on. Returns (hours, window)."""
+    worst, win = None, None
+    for w in ((row.get("limits") or {}).get("windows") or []):
+        p = w.get("pct")
+        if isinstance(p, (int, float)) and (100 - p) < 10:
+            h = _hours_until(w)
+            h = float("inf") if h is None else h
+            if worst is None or h > worst:
+                worst, win = h, w
+    return worst, win
+
+
 def recommend_row(rows, excludes):
-    """Earliest weekly renew first among SAFE accounts (>= 10% headroom, not near a
-    limit, not excluded, fresh). Returns the chosen row's summary, or None."""
-    usable = []
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        if account_key(row) in excludes:
-            continue
-        if _row_state(row) != "fresh":
-            continue
-        bw = _binding_window(row)
-        if not bw or (100 - bw["pct"]) < 10:
-            continue
-        usable.append(row)
-    if not usable:
+    """Earliest weekly renew first among SAFE accounts (>= 10% headroom, fresh, not
+    excluded). If none is safe, fall back to the account that frees up soonest.
+    Returns a summary dict with 'mode' = safe|fallback, or None."""
+    fresh = [r for r in rows if isinstance(r, dict) and account_key(r) not in excludes
+             and _row_state(r) == "fresh" and _binding_window(r)]
+    safe = [r for r in fresh if (100 - _binding_window(r)["pct"]) >= 10]
+    if safe:
+        def sort_key(row):
+            h = _hours_until(_renew_window(row))
+            return (float("inf") if h is None else h, _binding_window(row)["pct"], row.get("label") or "")
+        best = min(safe, key=sort_key)
+        bw = _binding_window(best)
+        return {"mode": "safe", "label": best.get("label"), "left": round(100 - bw["pct"]), "hrs": _hours_until(_renew_window(best))}
+    if not fresh:
         return None
-
-    def sort_key(row):
-        h = _hours_until(_renew_window(row))
-        return (float("inf") if h is None else h, _binding_window(row)["pct"], row.get("label") or "")
-
-    best = min(usable, key=sort_key)
+    best = min(fresh, key=lambda row: (_frees_up_hours(row)[0], row.get("label") or ""))
     bw = _binding_window(best)
-    return {"label": best.get("label"), "left": round(100 - bw["pct"]), "hrs": _hours_until(_renew_window(best))}
+    fh, fw = _frees_up_hours(best)
+    return {"mode": "fallback", "label": best.get("label"), "left": round(100 - bw["pct"]),
+            "free_hrs": fh, "free_kind": (fw or {}).get("kind")}
 
 
 def _kind_label(kind):
@@ -2089,9 +2132,15 @@ def build_notify_message(rows, crossings, excludes):
         out.append("```")
     for tool, title in (("claude", "Claude Code"), ("codex", "Codex")):
         rec = recommend_row([r for r in rows if isinstance(r, dict) and r.get("tool") == tool], excludes)
-        if rec:
+        if not rec:
+            continue
+        if rec["mode"] == "safe":
             renew = _fmt_in(rec["hrs"])
             out.append("**Use first (%s) → %s** — %d%% left%s" % (title, rec["label"], rec["left"], (", renews " + renew) if renew else ""))
+        else:
+            fh = rec.get("free_hrs")
+            free = "later" if fh is None or fh == float("inf") else _fmt_in(fh)
+            out.append(":hourglass: **All %s accounts near a limit** — %s frees up %s" % (title, rec["label"], free))
     return "\n".join(out)[:1990]
 
 

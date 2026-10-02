@@ -579,10 +579,11 @@ function render() {
   $("sub").innerHTML = META.live ? '<span class="dot"></span>Live' : "generated " + META.generated;
 
   const staleTag = (r) => {
-    // rowState classifies once; the badge names WHY a row is behind (dead vs
-    // rate-limited vs plain stale) instead of lumping them all as "re-sign in".
+    // rowState classifies once; the badge names WHY a row is behind. A DEAD
+    // account shows no text (per request) - the dimmed row and its sign-in (↪)
+    // icon are the cues, and the header still counts it in "N behind".
     const s = rowState(r);
-    if (s.kind === "dead") return '<span class="badge-dead">re-sign in needed</span>';
+    if (s.kind === "dead") return "";
     if (s.kind === "ratelimited") return '<span class="badge-rl">rate limited</span>';
     if (s.kind === "stale") {
       const h = s.mins / 60;

@@ -27,4 +27,11 @@ IP changing when you switch networks; the raw IP does not).
   upgrades to `https://` hit a hard `ERR_SSL_PROTOCOL_ERROR` with nothing to click.
 - The certificate and key are generated on first start into `tls/` (gitignored,
   key mode 600). Delete that folder to regenerate.
-- The host Mac must be awake and on the same network as the viewer.
+- The host Mac must be awake and on the same network as the viewer. A second
+  LaunchAgent (`deploy/local.ai-accounts.keepawake.plist`, install it next to the
+  dashboard one) runs `caffeinate -i -s` so the Mac does not idle-sleep; the macOS
+  default (`pmset` sleep = 1 minute) otherwise puts it to sleep shortly after the
+  display turns off and the dashboard goes dark. It cannot beat a **closed lid** on a
+  laptop (only a plugged-in clamshell with an external display stays awake) and it
+  drains the battery, so keep the Mac plugged in. Stop it with
+  `launchctl bootout gui/$(id -u)/local.ai-accounts.keepawake`.

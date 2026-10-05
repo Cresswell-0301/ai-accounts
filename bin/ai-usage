@@ -2172,9 +2172,120 @@ def check_and_notify(rows):
     discord_send(build_notify_message(rows, crossings, load_excludes()))
 
 
+# ── HTTPS on the same port ────────────────────────────────────────────────────
+# A browser handed (or auto-upgrading to) https://host:8787 sends a TLS ClientHello
+# at a plain-HTTP server, which can only answer with garbage: Chrome shows
+# ERR_SSL_PROTOCOL_ERROR ("can't provide a secure connection"), Safari/Firefox a
+# similar dead end, and nothing on screen to click. So sniff the first byte of every
+# connection: 0x16 is a TLS handshake, anything else is plain HTTP. A TLS client gets
+# a self-signed certificate (a one-time "not private - proceed" click, then the page);
+# a plain-HTTP client is untouched. The key stays in ~/.ai-accounts/tls (gitignored).
+import http.server as _http_server
+import socket as _socket
+import ssl as _ssl
+
+TLS_DIR = os.path.join(ROOT, "tls")
+TLS_CERT = os.path.join(TLS_DIR, "dashboard-cert.pem")
+TLS_KEY = os.path.join(TLS_DIR, "dashboard-key.pem")
+
+
+def _bonjour_host():
+    try:
+        out = subprocess.run(["scutil", "--get", "LocalHostName"], capture_output=True,
+                             text=True, timeout=5).stdout.strip()
+        if out:
+            return out + ".local"
+    except Exception:
+        pass
+    return _socket.gethostname() or "localhost"
+
+
+def ensure_tls_cert():
+    """(cert, key) paths, generating a self-signed pair on first use. None when
+    openssl is unavailable - the server then simply stays HTTP-only."""
+    if os.path.exists(TLS_CERT) and os.path.exists(TLS_KEY):
+        return TLS_CERT, TLS_KEY
+    import tempfile
+    host = _bonjour_host()
+    cfg = ("[req]\ndistinguished_name = dn\nx509_extensions = v3\nprompt = no\n"
+           "[dn]\nCN = %s\n"
+           "[v3]\nsubjectAltName = DNS:%s, DNS:localhost, IP:127.0.0.1\n"
+           "basicConstraints = CA:FALSE\n" % (host, host))
+    cfgpath = None
+    try:
+        os.makedirs(TLS_DIR, mode=0o700, exist_ok=True)
+        with tempfile.NamedTemporaryFile("w", suffix=".cnf", delete=False) as fh:
+            fh.write(cfg)
+            cfgpath = fh.name
+        subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                        "-sha256", "-days", "3650", "-keyout", TLS_KEY, "-out", TLS_CERT,
+                        "-config", cfgpath], check=True, capture_output=True, timeout=60)
+        os.chmod(TLS_KEY, 0o600)
+        return TLS_CERT, TLS_KEY
+    except Exception:
+        for p in (TLS_CERT, TLS_KEY):       # never leave half a pair behind
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+        return None
+    finally:
+        if cfgpath:
+            try:
+                os.unlink(cfgpath)
+            except OSError:
+                pass
+
+
+def make_tls_context():
+    pair = ensure_tls_cert()
+    if not pair:
+        return None
+    try:
+        ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
+        ctx.minimum_version = _ssl.TLSVersion.TLSv1_2
+        ctx.load_cert_chain(*pair)
+        return ctx
+    except (OSError, _ssl.SSLError):
+        return None
+
+
+class DualProtocolServer(_http_server.ThreadingHTTPServer):
+    """Plain HTTP and HTTPS on one port, told apart by the first byte."""
+    tls_context = None
+    _tls_seen = set()
+
+    def finish_request(self, request, client_address):
+        # Runs in the per-connection thread (ThreadingMixIn), so a client that
+        # connects and sends nothing - Chrome pre-connects speculatively - cannot
+        # stall the accept loop.
+        tls = None
+        ctx = self.tls_context
+        if ctx is not None:
+            try:
+                request.settimeout(30)
+                if request.recv(1, _socket.MSG_PEEK) == b"\x16":      # TLS ClientHello
+                    tls = ctx.wrap_socket(request, server_side=True)
+                    request = tls
+                    if client_address[0] not in self._tls_seen:       # one line per client
+                        self._tls_seen.add(client_address[0])
+                        print("  https client %s (self-signed cert)" % client_address[0], flush=True)
+                request.settimeout(None)
+            except (OSError, _ssl.SSLError):
+                return    # silent client, or one that refused the self-signed cert
+        try:
+            super().finish_request(request, client_address)
+        finally:
+            if tls is not None:
+                try:
+                    tls.close()
+                except OSError:
+                    pass
+
+
 def serve(a, port):
-    """Local dashboard that refreshes itself. Bound to loopback only: usage and
-    cost figures never leave the machine."""
+    """Local dashboard that refreshes itself. Bound to loopback by default: usage
+    and cost figures stay on the machine unless --host opens it to the LAN."""
     import http.server, threading, time
     cache = {"rows": None, "t": 0.0}
     lock = threading.Lock()
@@ -2225,6 +2336,15 @@ def serve(a, port):
 
         def do_POST(self):
             import urllib.parse
+            # Controls (add / remove / login / submit-code / exclude) are powerful,
+            # so they are accepted ONLY from this machine (loopback). When the server
+            # is bound to the LAN for colleagues to VIEW, a colleague's browser can
+            # still GET the page but a POST from their IP is refused here. Do the
+            # control actions from http://127.0.0.1:%d on this Mac.
+            if self.client_address[0] not in ("127.0.0.1", "::1", "::ffff:127.0.0.1"):
+                self._send(json.dumps({"ok": False, "error": "controls are only available on the host machine (http://127.0.0.1)"}),
+                           "application/json")
+                return
             try:
                 n = int(self.headers.get("Content-Length") or 0)
                 body = json.loads(self.rfile.read(n).decode() or "{}")
@@ -2309,9 +2429,15 @@ def serve(a, port):
     for i, key in enumerate(sorted(_usage_cache)):
         _usage_cache[key]["next_ok"] = _t.time() + i * 15
 
-    srv = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    host = getattr(a, "host", None) or "127.0.0.1"
+    srv = DualProtocolServer((host, port), Handler)
+    srv.tls_context = make_tls_context()
     url = "http://127.0.0.1:%d" % port
     print("live dashboard: %s" % url)
+    print("  https also answers on the same port (self-signed cert)" if srv.tls_context
+          else "  https unavailable (no openssl) - http only")
+    if host not in ("127.0.0.1", "localhost"):
+        print("  LAN view (GET only; controls stay on this machine): port %d on %s" % (port, host))
     n = len([x for x in (discover(a.legacy, a.include_excluded)) if x[1] == "claude"])
     print("  screen refresh every %ds \u00b7 API poll at most every %ds per account"
           % (a.interval, MIN_POLL_SECONDS))
@@ -2350,7 +2476,10 @@ def main():
                     help="render a local dashboard (default: ~/.ai-accounts/dashboard.html)")
     ap.add_argument("--open", action="store_true", dest="do_open", help="open the dashboard after writing it")
     ap.add_argument("--serve", nargs="?", const=8787, type=int, metavar="PORT",
-                    help="run a live dashboard on 127.0.0.1 (default port 8787)")
+                    help="run a live dashboard (default port 8787)")
+    ap.add_argument("--host", default="127.0.0.1", metavar="ADDR",
+                    help="bind address: 127.0.0.1 (default, this machine only) or 0.0.0.0 "
+                         "(also reachable on the LAN; controls still local)")
     ap.add_argument("--interval", type=int, default=10,
                     help="seconds between screen refreshes (default 10; costs no API calls)")
     ap.add_argument("--poll", type=int, default=MIN_POLL_SECONDS, metavar="SECONDS",

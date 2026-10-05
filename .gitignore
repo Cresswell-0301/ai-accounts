@@ -22,3 +22,5 @@ __pycache__/
 *.pyc
 /notify.json
 /.suggest-exclude.json
+/tls/
+*.pem

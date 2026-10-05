@@ -12,6 +12,8 @@
     <string>/Users/nexflo/.ai-accounts/bin/ai-usage</string>
     <string>--serve</string>
     <string>8787</string>
+    <string>--host</string>
+    <string>0.0.0.0</string>
     <string>--interval</string>
     <string>10</string>
   </array>

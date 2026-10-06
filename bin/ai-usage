@@ -2283,32 +2283,111 @@ class DualProtocolServer(_http_server.ThreadingHTTPServer):
                     pass
 
 
+import time as _time
+
+
+class RowCache:
+    """The dashboard's data, kept fresh OFF the request path.
+
+    A scan is slow, and on a busy Mac it is SLOW: it reads every session log and
+    asks the Keychain about each account, and it took 16 s once the machine's load
+    average passed 25. It used to run inside whichever request found the cache
+    stale, holding one global lock, so every other visitor queued behind it - from
+    a colleague's phone that is indistinguishable from the site being down.
+
+    So a request is answered from the last scan whenever one exists, and a stale
+    cache starts ONE background refresh. Only when there is nothing to show (the
+    first visit after a start, a just-added or just-removed account) or on an
+    explicit Sync now - the caller is waiting for fresh data - does a request scan
+    inline.
+    """
+
+    def __init__(self, scan_fn, max_age, on_publish=None):
+        self._scan = scan_fn
+        self._max_age = max_age
+        self._on_publish = on_publish
+        self._lock = _threading.Lock()        # guards the fields below; never held across a scan
+        self._scan_lock = _threading.Lock()   # one scan at a time: scans poll APIs and rotate tokens
+        self._rows = None
+        self._t = 0.0
+        self._epoch = 0                       # bumped when a result must not be overwritten by an older scan
+        self._refreshing = False
+
+    def invalidate(self):
+        """The data is WRONG now (account added or removed): the next get() scans inline."""
+        with self._lock:
+            self._rows = None
+            self._epoch += 1                  # a refresh already in flight predates this: drop its result
+
+    def mark_stale(self):
+        """The data is merely OLD: the next get() answers from it and refreshes behind."""
+        with self._lock:
+            self._t = 0.0
+
+    def _publish(self, rows, only_if_epoch=None):
+        with self._lock:
+            if only_if_epoch is not None and self._epoch != only_if_epoch:
+                return False                  # the world changed while this scan ran
+            self._rows, self._t = rows, _time.time()
+            if only_if_epoch is None:
+                self._epoch += 1              # an inline scan supersedes any refresh in flight
+        if self._on_publish:
+            self._on_publish(rows)
+        return True
+
+    def _refresh_bg(self, epoch):
+        try:
+            with self._scan_lock:
+                rows = self._scan()
+            self._publish(rows, only_if_epoch=epoch)
+        except Exception:
+            pass                              # keep serving the last good rows; the next request retries
+        finally:
+            with self._lock:
+                self._refreshing = False
+
+    def get(self, force=False, before_scan=None):
+        """(rows, scanned_at). Never waits on a scan when there is something to show."""
+        with self._lock:
+            if self._rows is not None and not force:
+                if _time.time() - self._t > self._max_age and not self._refreshing:
+                    self._refreshing = True
+                    _threading.Thread(target=self._refresh_bg, args=(self._epoch,), daemon=True).start()
+                return self._rows, self._t
+        # Nothing to show, or an explicit sync: the caller is waiting for fresh data.
+        if force and before_scan:
+            before_scan()
+        with self._scan_lock:
+            with self._lock:
+                if not force and self._rows is not None:
+                    return self._rows, self._t   # another request scanned while we waited
+            rows = self._scan()
+        self._publish(rows)
+        with self._lock:
+            return self._rows, self._t
+
+
 def serve(a, port):
     """Local dashboard that refreshes itself. Bound to loopback by default: usage
     and cost figures stay on the machine unless --host opens it to the LAN."""
     import http.server, threading, time
-    cache = {"rows": None, "t": 0.0}
-    lock = threading.Lock()
+
+    def clear_poll_floors():
+        # A manual sync clears the poll floor so it actually refetches, but NOT an
+        # active 429 backoff - forcing through that is what keeps the limit
+        # tripped. list(): a background scan may add an account while we iterate.
+        for ent in list(_usage_cache.values()):
+            if ent.get("stale_reason") and "Rate Limit" in str(ent["stale_reason"]):
+                continue
+            ent["next_ok"] = 0
+
+    # Check thresholds off the request path - a Discord POST must not block the
+    # page, and a webhook outage must not stall a refresh.
+    cache = RowCache(lambda: scan(a), a.interval,
+                     on_publish=lambda rows: threading.Thread(target=check_and_notify, args=(rows,), daemon=True).start())
 
     def rows_now(force=False):
-        with lock:
-            if force:
-                # A manual sync clears the poll floor so it actually refetches,
-                # but NOT an active 429 backoff - forcing through that is what
-                # keeps the limit tripped.
-                now_ = time.time()
-                for ent in _usage_cache.values():
-                    if ent.get("stale_reason") and "Rate Limit" in str(ent["stale_reason"]):
-                        continue
-                    ent["next_ok"] = 0
-            if force or cache["rows"] is None or time.time() - cache["t"] > a.interval:
-                cache["rows"] = scan(a)
-                cache["t"] = time.time()
-                # Check thresholds off the request path — a Discord POST must not
-                # block the page, and a webhook outage must not stall a refresh.
-                rows_snapshot = cache["rows"]
-                threading.Thread(target=check_and_notify, args=(rows_snapshot,), daemon=True).start()
-            return cache["rows"], cache["t"]
+        return cache.get(force=force, before_scan=clear_poll_floors)
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -2362,7 +2441,7 @@ def serve(a, port):
                 out = {"ok": ok, "error": None if ok else res,
                        "dir": res if ok else None}
                 if ok:
-                    cache["rows"] = None          # force a rescan
+                    cache.invalidate()            # force a rescan
             elif path == "/api/login":
                 url, err = start_login(tool, name, (body.get("email") or "").strip() or None)
                 out = {"ok": bool(url) and not err, "url": url, "error": err}
@@ -2374,27 +2453,23 @@ def serve(a, port):
                     # Codex probes run only for codex/all, and Claude's poll
                     # floors are cleared only for claude/all.
                     results = sync_codex() if tool in ("", "codex") else {}
-                    with lock:
-                        cache["rows"] = None
-                        if tool in ("", "claude"):
-                            for ent in _usage_cache.values():
-                                if ent.get("stale_reason") and "Rate Limit" in str(ent["stale_reason"]):
-                                    continue
-                                ent["next_ok"] = 0
+                    cache.invalidate()
+                    if tool in ("", "claude"):
+                        clear_poll_floors()
                     out = {"ok": True, "tool": tool or "all", "codex": results}
             elif path == "/api/remove":
                 ok, res = remove_profile(tool, name)
                 out = {"ok": ok, "error": None if ok else res,
                        "removed": res if ok else None}
                 if ok:
-                    cache["rows"] = None
+                    cache.invalidate()
             elif path == "/api/login-code":
                 ok, msg = submit_login_code(tool, name, body.get("code"))
                 out = {"ok": ok, "error": None if ok else msg}
             elif path == "/api/login-state":
                 if tool in ("claude", "codex") and _valid_name(name):
                     out = dict(login_state(tool, name)); out["ok"] = True
-                    cache["rows"] = None
+                    cache.invalidate()
                 else:
                     out = {"ok": False, "error": "bad account"}
             elif path == "/api/suggest-exclude":
@@ -2418,8 +2493,7 @@ def serve(a, port):
                 if due:
                     with cf.ThreadPoolExecutor(max_workers=4) as ex:
                         list(ex.map(lambda d: probe_codex(d, AUTO_CODEX_SECONDS), due))
-                    with lock:
-                        cache["rows"] = None
+                    cache.mark_stale()            # new Codex numbers; refresh behind, never block a viewer
             except Exception:
                 pass
             time.sleep(60)
@@ -2428,6 +2502,10 @@ def serve(a, port):
     import time as _t
     for i, key in enumerate(sorted(_usage_cache)):
         _usage_cache[key]["next_ok"] = _t.time() + i * 15
+    # Scan once now, in the background, so the first visitor after a restart is
+    # served from a warm cache instead of waiting on the scan. A request that
+    # arrives mid-scan waits for it rather than starting a second one.
+    threading.Thread(target=cache.get, daemon=True).start()
 
     host = getattr(a, "host", None) or "127.0.0.1"
     srv = DualProtocolServer((host, port), Handler)

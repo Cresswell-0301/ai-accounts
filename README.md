@@ -27,11 +27,17 @@ IP changing when you switch networks; the raw IP does not).
   upgrades to `https://` hit a hard `ERR_SSL_PROTOCOL_ERROR` with nothing to click.
 - The certificate and key are generated on first start into `tls/` (gitignored,
   key mode 600). Delete that folder to regenerate.
-- The host Mac must be awake and on the same network as the viewer. A second
-  LaunchAgent (`deploy/local.ai-accounts.keepawake.plist`, install it next to the
-  dashboard one) runs `caffeinate -i -s` so the Mac does not idle-sleep; the macOS
-  default (`pmset` sleep = 1 minute) otherwise puts it to sleep shortly after the
-  display turns off and the dashboard goes dark. It cannot beat a **closed lid** on a
-  laptop (only a plugged-in clamshell with an external display stays awake) and it
-  drains the battery, so keep the Mac plugged in. Stop it with
+- The host Mac must be awake and on the same network as the viewer. On macOS
+  defaults it idle-sleeps about a minute after the display turns off, and the
+  dashboard is unreachable while it sleeps. **Optional:** a second LaunchAgent
+  (`deploy/local.ai-accounts.keepawake.plist`) runs `caffeinate -i -s` to prevent
+  that. It is NOT installed by default (the host owner removed it: it keeps the Mac
+  awake and drains the battery), and it cannot beat a closed laptop lid. Install it
+  only if you want the dashboard reachable all day; stop it with
   `launchctl bootout gui/$(id -u)/local.ai-accounts.keepawake`.
+- **A busy Mac never makes the page hang.** The data is served from the last scan,
+  and a stale cache is refreshed in the background (`RowCache`). Before this, the
+  scan ran inside whichever request found the cache stale and held a global lock,
+  so on a loaded Mac (a scan took 16 s at load average 25+) every viewer queued
+  behind it and the site looked down. Now the load only delays how fresh the numbers
+  are; Sync now, adding/removing an account and signing in still wait for a fresh scan.
